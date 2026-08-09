@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import time
+import traceback
 from queue import Empty, Full, Queue
 
 from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
@@ -18,6 +19,13 @@ from .face_db_adapter import (DEVICE_ID, MATCH_CONF_TH, SFACE, build_index,
 
 LOGGER = logging.getLogger(__name__)
 PERF = get_perf_logger()
+
+
+def _log_worker_exception(stage, exc, elapsed_ms=0.0):
+    stack = traceback.format_exc()
+    message = "%s: %s\n%s" % (stage, exc, stack)
+    LOGGER.error(message)
+    PERF.event("EnrollWorker exception", elapsed_ms, message, level="WARNING")
 
 
 class EnrollWorker(QThread):
@@ -51,11 +59,14 @@ class EnrollWorker(QThread):
         except Full:
             try:
                 self._queue.get_nowait()
-            except Empty:
-                pass
+            except Empty as exc:
+                _log_worker_exception(
+                    "EnrollWorker queue replacement found no old frame", exc)
             try:
                 self._queue.put_nowait(item)
-            except Full:
+            except Full as exc:
+                _log_worker_exception(
+                    "EnrollWorker queue replacement still full", exc)
                 return
             PERF.increment("enroll_queue_dropped")
             PERF.event("主动跳帧（正常）", 0.0,
@@ -81,12 +92,34 @@ class EnrollWorker(QThread):
         self._running = True
         try:
             self.status_ready.emit("人脸模型加载中...")
-            self._yunet_session.load()
-            self._yunet_idx = build_index(self._yunet_session)
+            yunet_started_ns = time.perf_counter_ns()
+            PERF.event("EnrollWorker YuNet load start", detail="shared singleton")
+            try:
+                self._yunet_session.load()
+                self._yunet_idx = build_index(self._yunet_session)
+            except Exception as exc:
+                _log_worker_exception(
+                    "EnrollWorker YuNet load failed", exc,
+                    (time.perf_counter_ns() - yunet_started_ns) / 1e6)
+                raise
+            PERF.event("EnrollWorker YuNet load complete",
+                       (time.perf_counter_ns() - yunet_started_ns) / 1e6,
+                       "shared singleton")
             from ais_bench.infer.interface import InferSession
-            if not os.path.isfile(SFACE):
-                raise RuntimeError("SFace 模型不存在：%s" % SFACE)
-            self._sface_session = InferSession(DEVICE_ID, SFACE)
+            sface_started_ns = time.perf_counter_ns()
+            PERF.event("EnrollWorker SFace load start", detail=SFACE)
+            try:
+                if not os.path.isfile(SFACE):
+                    raise RuntimeError("SFace 模型不存在：%s" % SFACE)
+                self._sface_session = InferSession(DEVICE_ID, SFACE)
+            except Exception as exc:
+                _log_worker_exception(
+                    "EnrollWorker SFace load failed", exc,
+                    (time.perf_counter_ns() - sface_started_ns) / 1e6)
+                raise
+            PERF.event("EnrollWorker SFace load complete",
+                       (time.perf_counter_ns() - sface_started_ns) / 1e6,
+                       SFACE)
             self.status_ready.emit("人脸模型已就绪")
             while self._running:
                 try:
@@ -102,24 +135,41 @@ class EnrollWorker(QThread):
                         self._process_match(bgr_frame)
                 except Exception as exc:
                     message = "人脸处理异常：%s" % exc
-                    if message != self._last_error:
-                        LOGGER.exception(message)
-                        self._last_error = message
+                    _log_worker_exception("EnrollWorker frame processing failed", exc)
+                    self._last_error = message
                     self.error_occurred.emit(message)
         except Exception as exc:
             message = "人脸模型加载失败：%s" % exc
-            LOGGER.exception(message)
+            _log_worker_exception("EnrollWorker run failed", exc)
             self.error_occurred.emit(message)
         finally:
+            release_started_ns = time.perf_counter_ns()
+            PERF.event("EnrollWorker model release start",
+                       detail="SFace release; YuNet singleton retained")
             if self._sface_session is not None:
                 del self._sface_session
                 self._sface_session = None
                 gc.collect()
             self._yunet_idx = None
+            PERF.event("EnrollWorker model release complete",
+                       (time.perf_counter_ns() - release_started_ns) / 1e6,
+                       "SFace released; YuNet singleton retained")
 
     def _process_enroll(self, bgr_frame):
-        feat, score, reason = extract_feature_for_enroll(
-            self._yunet_session, self._yunet_idx, self._sface_session, bgr_frame)
+        started_ns = time.perf_counter_ns()
+        PERF.event("EnrollWorker extract_feature_for_enroll start")
+        try:
+            feat, score, reason = extract_feature_for_enroll(
+                self._yunet_session, self._yunet_idx, self._sface_session, bgr_frame)
+        except Exception as exc:
+            _log_worker_exception(
+                "EnrollWorker extract_feature_for_enroll failed", exc,
+                (time.perf_counter_ns() - started_ns) / 1e6)
+            raise
+        PERF.event("EnrollWorker extract_feature_for_enroll returned",
+                   (time.perf_counter_ns() - started_ns) / 1e6,
+                   "success=%s score=%s reason=%s" %
+                   (feat is not None, score, reason))
         with self._mode_lock:
             if self._mode != "enroll":
                 return
@@ -130,7 +180,19 @@ class EnrollWorker(QThread):
             name = self._enroll_name
         self.enroll_progress.emit(count, target, float(score or 0.0), reason or "采集成功")
         if count >= target:
-            record = enroll_person(name, self._enroll_feats)
+            started_ns = time.perf_counter_ns()
+            PERF.event("EnrollWorker enroll_person start",
+                       detail="name=%s samples=%d" % (name, count))
+            try:
+                record = enroll_person(name, self._enroll_feats)
+            except Exception as exc:
+                _log_worker_exception(
+                    "EnrollWorker enroll_person failed", exc,
+                    (time.perf_counter_ns() - started_ns) / 1e6)
+                raise
+            PERF.event("EnrollWorker enroll_person returned",
+                       (time.perf_counter_ns() - started_ns) / 1e6,
+                       "success=True name=%s samples=%d" % (name, count))
             with self._mode_lock:
                 self._mode = "match"
                 self._enroll_name = ""

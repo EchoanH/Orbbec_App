@@ -1,7 +1,9 @@
 """人脸录入、实时识别与人员库管理页面。"""
 
+import logging
 import math
 import time
+import traceback
 
 import numpy as np
 from PyQt5.QtCore import Qt, QRectF
@@ -14,12 +16,22 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFrame,
 from inference.enroll_worker import EnrollWorker
 from inference.face_db_adapter import delete_person, list_enrolled
 from inference.face14_infer import draw_face_guide
+from perf_logging import get_perf_logger
 
 from .base_page import BasePage
 
 
 SMOOTHING_TAU_MS = 30.0
 NAME_STABLE_FRAMES = 3
+LOGGER = logging.getLogger(__name__)
+PERF = get_perf_logger()
+
+
+def _log_page_exception(stage, exc):
+    stack = traceback.format_exc()
+    message = "%s: %s\n%s" % (stage, exc, stack)
+    LOGGER.error(message)
+    PERF.event("EnrollPage exception", detail=message, level="WARNING")
 
 
 class EnrollPage(BasePage):
@@ -121,44 +133,76 @@ class EnrollPage(BasePage):
         return self._draw_match(bgr_frame, box, label), self._status_text
 
     def on_activated(self):
+        started_ns = time.perf_counter_ns()
+        PERF.event("EnrollPage activate start", detail="active=True")
         self._active = True
-        self._refresh_people()
-        if self._worker is None:
-            self._start_worker()
-        elif self._stop_requested:
-            self._restart_when_finished = True
+        try:
+            self._refresh_people()
+            if self._worker is None:
+                self._start_worker()
+            elif self._stop_requested:
+                self._restart_when_finished = True
+        except Exception as exc:
+            _log_page_exception("EnrollPage activate failed", exc)
+            raise
+        PERF.event("EnrollPage activate complete",
+                   (time.perf_counter_ns() - started_ns) / 1e6)
 
     def on_deactivated(self):
+        started_ns = time.perf_counter_ns()
+        PERF.event("EnrollPage deactivate start", detail="begin worker stop/release")
         self._active = False
-        self._reset_match()
-        self._set_enrolling(False)
-        self._restart_when_finished = False
-        if self._worker is not None:
-            self._worker.cancel_enrollment()
-            self._stop_requested = True
-            self._worker.stop()
-            if self._worker.isRunning():
-                self._worker.wait()
+        try:
+            self._reset_match()
+            self._set_enrolling(False)
+            self._restart_when_finished = False
+            if self._worker is not None:
+                self._worker.cancel_enrollment()
+                self._stop_requested = True
+                self._worker.stop()
+                if self._worker.isRunning():
+                    self._worker.wait()
+        except Exception as exc:
+            _log_page_exception("EnrollPage deactivate failed", exc)
+            raise
+        PERF.event("EnrollPage deactivate complete",
+                   (time.perf_counter_ns() - started_ns) / 1e6)
 
     def _start_worker(self):
+        started_ns = time.perf_counter_ns()
+        PERF.event("EnrollPage model loading start",
+                   detail="start EnrollWorker; YuNet singleton id=%s + SFace" %
+                   id(self._yunet_session))
         self._status_text = "人脸模型加载中..."
         self._stop_requested = False
-        worker = EnrollWorker(self._yunet_session, self)
-        worker.status_ready.connect(self._on_status)
-        worker.match_ready.connect(self._on_match)
-        worker.enroll_progress.connect(self._on_enroll_progress)
-        worker.enroll_complete.connect(self._on_enroll_complete)
-        worker.error_occurred.connect(self._on_error)
-        worker.finished.connect(self._on_finished)
-        self._worker = worker
-        worker.start()
+        try:
+            worker = EnrollWorker(self._yunet_session, self)
+            worker.status_ready.connect(self._on_status)
+            worker.match_ready.connect(self._on_match)
+            worker.enroll_progress.connect(self._on_enroll_progress)
+            worker.enroll_complete.connect(self._on_enroll_complete)
+            worker.error_occurred.connect(self._on_error)
+            worker.finished.connect(self._on_finished)
+            self._worker = worker
+            worker.start()
+        except Exception as exc:
+            _log_page_exception("EnrollPage model loading start failed", exc)
+            raise
+        PERF.event("EnrollPage model loading dispatched",
+                   (time.perf_counter_ns() - started_ns) / 1e6)
 
     def _start_enrollment(self):
+        clicked_ns = time.perf_counter_ns()
+        PERF.event("EnrollPage enroll button clicked", detail="before validation")
         name = self.name_edit.text().strip()
         if not name:
             QMessageBox.warning(self, "无法录入", "请输入姓名。")
             return
-        existing = {row[0] for row in list_enrolled()}
+        try:
+            existing = {row[0] for row in list_enrolled()}
+        except Exception as exc:
+            _log_page_exception("EnrollPage enroll validation failed", exc)
+            raise
         if name in existing:
             answer = QMessageBox.question(
                 self, "确认覆盖", "该姓名已录入，是否覆盖？",
@@ -171,9 +215,20 @@ class EnrollPage(BasePage):
         target = self.sample_spin.value()
         self._set_enrolling(True)
         self.result_label.setText("开始录入 %s：0/%d\n请正对摄像头并保持光线充足" % (name, target))
-        self._worker.start_enrollment(name, target)
+        PERF.event("EnrollPage start_enrollment dispatch",
+                   (time.perf_counter_ns() - clicked_ns) / 1e6,
+                   "name=%s target=%d; worker will call extract_feature_for_enroll" %
+                   (name, target))
+        try:
+            self._worker.start_enrollment(name, target)
+        except Exception as exc:
+            _log_page_exception("EnrollPage start_enrollment failed", exc)
+            raise
+        PERF.event("EnrollPage start_enrollment dispatched",
+                   (time.perf_counter_ns() - clicked_ns) / 1e6)
 
     def _on_status(self, text):
+        PERF.event("EnrollPage worker status", detail=str(text))
         self._status_text = text
 
     def _on_match(self, box, name, similarity, detection_score, reason):
@@ -206,6 +261,9 @@ class EnrollPage(BasePage):
             display_name, similarity, detection_score)
 
     def _on_enroll_progress(self, count, target, score, reason):
+        PERF.event("EnrollPage enroll progress",
+                   detail="count=%d/%d score=%.3f reason=%s" %
+                   (count, target, score, reason))
         if not self._enrolling:
             return
         self.result_label.setText(
@@ -213,6 +271,9 @@ class EnrollPage(BasePage):
         self._status_text = "录入中 %d/%d · %s" % (count, target, reason)
 
     def _on_enroll_complete(self, name, record):
+        PERF.event("EnrollPage enroll complete",
+                   detail="name=%s sample_count=%s" %
+                   (name, record.get("sample_count", 0)))
         self._set_enrolling(False)
         self._refresh_people()
         self.result_label.setText(
@@ -222,6 +283,7 @@ class EnrollPage(BasePage):
         QMessageBox.information(self, "录入完成", "%s 已成功录入。" % name)
 
     def _on_error(self, text):
+        PERF.event("EnrollPage worker error", detail=str(text), level="WARNING")
         self._reset_match()
         self._set_enrolling(False)
         self._status_text = text
@@ -229,6 +291,8 @@ class EnrollPage(BasePage):
 
     def _on_finished(self):
         worker = self.sender()
+        PERF.event("EnrollPage worker finished",
+                   detail="same_worker=%s" % (worker is self._worker))
         if worker is self._worker:
             self._worker = None
         worker.deleteLater()
@@ -256,13 +320,22 @@ class EnrollPage(BasePage):
             QMessageBox.warning(self, "删除失败", "该姓名已不存在。")
 
     def _refresh_people(self):
-        records = list_enrolled()
+        started_ns = time.perf_counter_ns()
+        try:
+            records = list_enrolled()
+        except Exception as exc:
+            _log_page_exception("EnrollPage list_enrolled failed", exc)
+            raise
         self.people_table.setRowCount(len(records))
         for row, (name, sample_count, enrolled_at) in enumerate(records):
             self.people_table.setItem(row, 0, QTableWidgetItem(str(name)))
             self.people_table.setItem(row, 1, QTableWidgetItem(str(sample_count)))
             self.people_table.setItem(row, 2, QTableWidgetItem(str(enrolled_at)))
         self.count_label.setText("已录入人员：%d" % len(records))
+
+        PERF.event("EnrollPage list_enrolled returned",
+                   (time.perf_counter_ns() - started_ns) / 1e6,
+                   "count=%d" % len(records))
 
     def _set_enrolling(self, active):
         self._enrolling = active
@@ -328,10 +401,18 @@ class EnrollPage(BasePage):
         return drawn_rgb[:, :, ::-1].copy()
 
     def _shutdown_worker(self):
+        started_ns = time.perf_counter_ns()
+        PERF.event("EnrollPage shutdown start")
         self._active = False
         worker = self._worker
-        if worker is not None and worker.isRunning():
-            worker.cancel_enrollment()
-            worker.stop()
-            worker.wait()
-        self._worker = None
+        try:
+            if worker is not None and worker.isRunning():
+                worker.cancel_enrollment()
+                worker.stop()
+                worker.wait()
+            self._worker = None
+        except Exception as exc:
+            _log_page_exception("EnrollPage shutdown failed", exc)
+            raise
+        PERF.event("EnrollPage shutdown complete",
+                   (time.perf_counter_ns() - started_ns) / 1e6)
