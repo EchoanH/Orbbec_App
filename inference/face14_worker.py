@@ -19,7 +19,7 @@ class Face14Worker(QThread):
     """容量为 1 的跳帧 worker，采集和 GUI 不等待推理完成。"""
 
     status_ready = pyqtSignal(str)
-    result_ready = pyqtSignal(object, float, float, str)
+    result_ready = pyqtSignal(object, object, float, float, str)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, yunet_session, parent=None):
@@ -100,7 +100,7 @@ class Face14Worker(QThread):
                            "最新帧排队延迟")
                 started = time.perf_counter()
                 try:
-                    face14, score = self._engine.infer(bgr_frame)
+                    face14, face_box, score = self._engine.infer(bgr_frame)
                     elapsed_ms = (time.perf_counter() - started) * 1000.0
                     PERF.increment("inference_frames")
                     self._inference_timestamps.append(time.perf_counter_ns())
@@ -117,10 +117,10 @@ class Face14Worker(QThread):
                     self._last_error = None
                     if face14 is None:
                         text = "未检测到人脸 · %s" % update_rate_text
-                        self.result_ready.emit(None, 0.0, elapsed_ms, text)
+                        self.result_ready.emit(None, None, 0.0, elapsed_ms, text)
                     else:
                         text = "已检测 · 置信度 %.3f · %s" % (score, update_rate_text)
-                        self.result_ready.emit(face14, score, elapsed_ms, text)
+                        self.result_ready.emit(face14, face_box, score, elapsed_ms, text)
                 except Exception as exc:
                     total_ms = (time.perf_counter_ns() - frame_started_ns) / 1e6
                     PERF.event("Face14单帧总耗时", total_ms,

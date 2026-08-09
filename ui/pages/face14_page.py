@@ -31,6 +31,8 @@ class Face14Page(BasePage):
         self._worker = None
         self._active = False
         self._latest_face14 = None
+        self._latest_face_box = None
+        self._latest_score = 0.0
         self._display_face14 = None
         self._smoothing_tick_ns = None
         self._status_text = "模型加载中..."
@@ -53,7 +55,8 @@ class Face14Page(BasePage):
             return bgr_frame, self._status_text
         try:
             display_face14 = self._update_display_face14()
-            return draw_face14(bgr_frame, display_face14), self._status_text
+            return draw_face14(bgr_frame, display_face14,
+                               self._latest_face_box, self._latest_score), self._status_text
         except Exception as exc:
             message = "关键点绘制异常：%s" % exc
             if message != self._last_draw_error:
@@ -71,6 +74,8 @@ class Face14Page(BasePage):
     def on_deactivated(self):
         self._active = False
         self._latest_face14 = None
+        self._latest_face_box = None
+        self._latest_score = 0.0
         self._display_face14 = None
         self._smoothing_tick_ns = None
         self._restart_when_finished = False
@@ -96,10 +101,12 @@ class Face14Page(BasePage):
     def _on_status(self, text):
         self._status_text = text
 
-    def _on_result(self, face14, score, elapsed_ms, text):
+    def _on_result(self, face14, face_box, score, elapsed_ms, text):
         if not self._active or self._worker_stop_requested:
             return
         self._latest_face14 = face14
+        self._latest_face_box = face_box
+        self._latest_score = score
         if face14 is None:
             self._display_face14 = None
             self._smoothing_tick_ns = None
@@ -112,6 +119,8 @@ class Face14Page(BasePage):
     def _on_error(self, text):
         self._worker_failed = True
         self._latest_face14 = None
+        self._latest_face_box = None
+        self._latest_score = 0.0
         self._display_face14 = None
         self._smoothing_tick_ns = None
         self._status_text = text

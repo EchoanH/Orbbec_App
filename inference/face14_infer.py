@@ -30,6 +30,8 @@ PART_COLOR = {
     "口": (0, 0, 255),
     "脸颊/轮廓": (255, 0, 255),
 }
+FACE_BOX_COLOR = (255, 158, 74)
+FACE_BOX_TEXT_COLOR = (31, 19, 8)
 
 torch = None
 InferSession = None
@@ -200,17 +202,28 @@ def yunet_get_facebox(sess_yunet, idx, img_bgr):
     return b[best], s[best]
 
 
-# 只按允许项删除文件写入和 out_path 参数，绘制逻辑保持原样。
-def draw_face14(img_bgr, face14):
+# 只调整可视化内容：人脸框 + 置信度 + 五色关键点，不连接关键点。
+def draw_face14(img_bgr, face14, face_box, score):
     canvas = img_bgr.copy()
+    height, width = canvas.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in face_box]
+    x1 = max(0, min(width - 1, x1))
+    y1 = max(0, min(height - 1, y1))
+    x2 = max(0, min(width - 1, x2))
+    y2 = max(0, min(height - 1, y2))
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), FACE_BOX_COLOR, 2)
+    label = "conf %.3f" % float(score)
+    (text_w, text_h), baseline = cv2.getTextSize(
+        label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+    label_y = max(0, y1 - text_h - baseline - 8)
+    cv2.rectangle(canvas, (x1, label_y),
+                  (x1 + text_w + 12, label_y + text_h + baseline + 8),
+                  FACE_BOX_COLOR, -1)
+    cv2.putText(canvas, label, (x1 + 6, label_y + text_h + 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, FACE_BOX_TEXT_COLOR, 2,
+                cv2.LINE_AA)
     for part, names in FACE14_BY_PART.items():
         color = PART_COLOR[part]
-        pts_this_part = [face14[n] for n in names]
-        if len(pts_this_part) >= 2:
-            for i in range(len(pts_this_part) - 1):
-                p1 = tuple(int(v) for v in pts_this_part[i])
-                p2 = tuple(int(v) for v in pts_this_part[i + 1])
-                cv2.line(canvas, p1, p2, color, 1, cv2.LINE_AA)
         for name in names:
             x, y = face14[name]
             cv2.circle(canvas, (int(x), int(y)), 4, color, -1)
@@ -258,7 +271,7 @@ class Face14Engine(object):
         """执行 YuNet + landmark111 单帧完整链路。"""
         face_box, score = yunet_get_facebox(self.sess_yunet, self.yunet_idx, img_bgr)
         if face_box is None:
-            return None, None
+            return None, None, None
         crop_started_ns = time.perf_counter_ns()
         cropped, cropped_box = crop_square(img_bgr, face_box)
         PERF.event("landmark裁剪完成",
@@ -280,7 +293,7 @@ class Face14Engine(object):
         face14 = extract_face14(lmks105)
         PERF.event("14点映射完成",
                    (time.perf_counter_ns() - mapping_started_ns) / 1e6)
-        return face14, float(score)
+        return face14, face_box, float(score)
 
     def release(self):
         """当前 ais_bench 无 free_resource，按已验证方式删除会话引用。"""

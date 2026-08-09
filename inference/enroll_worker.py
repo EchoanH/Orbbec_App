@@ -22,7 +22,7 @@ PERF = get_perf_logger()
 
 class EnrollWorker(QThread):
     status_ready = pyqtSignal(str)
-    match_ready = pyqtSignal(object, object, float, str)
+    match_ready = pyqtSignal(object, object, float, float, str)
     enroll_progress = pyqtSignal(int, int, float, str)
     enroll_complete = pyqtSignal(str, object)
     error_occurred = pyqtSignal(str)
@@ -141,12 +141,15 @@ class EnrollWorker(QThread):
         feat, score, reason = extract_feature_for_match(
             self._yunet_session, self._yunet_idx, self._sface_session, bgr_frame)
         box = None
+        detection_score = float(score or 0.0)
         if feat is not None:
             face = detect_face(self._yunet_session, self._yunet_idx, bgr_frame, MATCH_CONF_TH)
             if face is not None:
+                detection_score = float(face[0])
                 box = face[1].tolist()
             name, similarity = match_feature(feat)
             text = reason or ("已匹配" if name else "未知")
-            self.match_ready.emit(box, name, float(similarity), text)
+            self.match_ready.emit(box, name, float(similarity), detection_score, text)
         else:
-            self.match_ready.emit(None, None, float(score or 0.0), reason or "未检测到人脸")
+            self.match_ready.emit(None, None, 0.0, detection_score,
+                                  reason or "未检测到人脸")

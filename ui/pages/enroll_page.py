@@ -37,6 +37,7 @@ class EnrollPage(BasePage):
         self._display_box = None
         self._smoothing_tick_ns = None
         self._latest_similarity = 0.0
+        self._latest_detection_score = 0.0
         self._pending_name = None
         self._pending_count = 0
         self._stable_name = ""
@@ -111,7 +112,11 @@ class EnrollPage(BasePage):
         box = self._update_display_box()
         label = self._stable_name or "识别中"
         if self._stable_name:
-            label = "%s %.2f" % (self._stable_name, self._latest_similarity)
+            label = "%s %.2f · conf %.3f" % (
+                self._stable_name, self._latest_similarity,
+                self._latest_detection_score)
+        else:
+            label = "识别中 · conf %.3f" % self._latest_detection_score
         return self._draw_match(bgr_frame, box, label), self._status_text
 
     def on_activated(self):
@@ -170,7 +175,7 @@ class EnrollPage(BasePage):
     def _on_status(self, text):
         self._status_text = text
 
-    def _on_match(self, box, name, similarity, reason):
+    def _on_match(self, box, name, similarity, detection_score, reason):
         if not self._active or self._stop_requested or self._enrolling:
             return
         if box is None:
@@ -191,9 +196,13 @@ class EnrollPage(BasePage):
         if self._pending_count >= NAME_STABLE_FRAMES:
             self._stable_name = candidate
         self._latest_similarity = similarity
+        self._latest_detection_score = detection_score
         display_name = self._stable_name or "识别中"
-        self.result_label.setText("识别结果：%s\n相似度：%.3f" % (display_name, similarity))
-        self._status_text = "%s · 相似度 %.3f" % (display_name, similarity)
+        self.result_label.setText(
+            "识别结果：%s\n相似度：%.3f\n检测置信度：%.3f" % (
+                display_name, similarity, detection_score))
+        self._status_text = "%s · 相似度 %.3f · 检测 %.3f" % (
+            display_name, similarity, detection_score)
 
     def _on_enroll_progress(self, count, target, score, reason):
         if not self._enrolling:
@@ -279,6 +288,7 @@ class EnrollPage(BasePage):
         self._display_box = None
         self._smoothing_tick_ns = None
         self._latest_similarity = 0.0
+        self._latest_detection_score = 0.0
         self._pending_name = None
         self._pending_count = 0
         self._stable_name = ""
