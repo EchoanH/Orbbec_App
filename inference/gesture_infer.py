@@ -9,6 +9,8 @@ import re
 import cv2
 import numpy as np
 
+from .depth_utils import color_to_depth_point, get_distance
+
 
 PALM_OM = "/root/echo/atc_work/palm_192_nr.om"
 HAND_OM = "/root/echo/atc_work/handpose_224.om"
@@ -226,22 +228,29 @@ class GestureEngine(object):
         self.palm_session = InferSession(0, PALM_OM)
         self.hand_session = InferSession(0, HAND_OM)
 
-    def infer(self, bgr):
+    def infer(self, bgr, depth_mm=None):
         palms, palm_score = palm_detect(self.palm_session, self.anchors, bgr)
         if not palms:
-            return None, None, 0.0, "palm 未检出（最高 %.3f）" % palm_score
+            return None, None, 0.0, None, "palm 未检出（最高 %.3f）" % palm_score
         pre = preprocess(bgr, palms[0][0])
         if pre is None:
-            return None, None, 0.0, "手部裁剪失败"
+            return None, None, 0.0, None, "手部裁剪失败"
         blob, rb, ang, rm, pad_bias = pre
         result = postprocess(self.hand_session.infer([blob]), rb, ang, rm, pad_bias)
         if result is None:
-            return None, None, 0.0, "handpose 输出解析失败"
+            return None, None, 0.0, None, "handpose 输出解析失败"
         lm, conf, handed = result
         if conf < HAND_CONF_TH:
-            return None, None, conf, "handpose 置信度 %.3f" % conf
+            return None, None, conf, None, "handpose 置信度 %.3f" % conf
         gesture, detail = classify(lm)
-        return lm, gesture, conf, detail
+        distance_cm = None
+        if depth_mm is not None and getattr(depth_mm, "ndim", 0) >= 2:
+            depth_x, depth_y = color_to_depth_point(
+                lm[0][0], lm[0][1], bgr.shape, depth_mm.shape)
+            distance_mm = get_distance(depth_mm, depth_x, depth_y)
+            if distance_mm > 0.0:
+                distance_cm = distance_mm / 10.0
+        return lm, gesture, conf, distance_cm, detail
 
     def release(self):
         if self.hand_session is not None:

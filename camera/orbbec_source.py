@@ -68,7 +68,7 @@ class OrbbecSource(object):
         LOGGER.info("Orbbec 取流已启动：彩色 1280x720 MJPG，深度 1280x800 Y16")
 
     def read(self, timeout_ms=300) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """读取一帧并解码为 BGR 与对齐后的 uint16 深度数组。"""
+        """读取一帧并解码为 BGR 与对齐后的 float32 毫米深度数组。"""
         if not self._started:
             return None
         started_ns = time.perf_counter_ns()
@@ -92,11 +92,12 @@ class OrbbecSource(object):
             return None
         bgr = cv2.imdecode(
             np.frombuffer(color_frame.get_data(), np.uint8), cv2.IMREAD_COLOR)
-        depth = np.frombuffer(depth_frame.get_data(), np.uint16).reshape(
-            depth_frame.get_height(), depth_frame.get_width())
+        depth_mm = np.frombuffer(depth_frame.get_data(), np.uint16).reshape(
+            depth_frame.get_height(), depth_frame.get_width()).astype(
+                np.float32, copy=False)
         if bgr is None:
             raise RuntimeError("彩色帧 MJPG 解码失败")
-        return bgr, depth
+        return bgr, depth_mm
 
     def stop(self):
         """停止 pipeline，释放引用；重复调用保持幂等。"""

@@ -10,6 +10,8 @@ import numpy as np
 
 from perf_logging import get_perf_logger
 
+from .depth_utils import color_to_depth_point, get_distance
+
 
 YUNET_OM = "/root/echo/atc_work/yunet_640.om"
 LANDMARK_OM = "/root/echo/atc_work/landmark111_112.om"
@@ -283,11 +285,11 @@ class Face14Engine(object):
         self.sess_landmark = InferSession(0, LANDMARK_OM)
         self.yunet_idx, self.yunet_index_mode = yunet_build_index(self.sess_yunet)
 
-    def infer(self, img_bgr):
+    def infer(self, img_bgr, depth_mm=None):
         """执行 YuNet + landmark111 单帧完整链路。"""
         face_box, score = yunet_get_facebox(self.sess_yunet, self.yunet_idx, img_bgr)
         if face_box is None:
-            return None, None, None
+            return None, None, None, None
         crop_started_ns = time.perf_counter_ns()
         cropped, cropped_box = crop_square(img_bgr, face_box)
         PERF.event("landmark裁剪完成",
@@ -309,7 +311,16 @@ class Face14Engine(object):
         face14 = extract_face14(lmks105)
         PERF.event("14点映射完成",
                    (time.perf_counter_ns() - mapping_started_ns) / 1e6)
-        return face14, face_box, float(score)
+        distance_cm = None
+        if depth_mm is not None and getattr(depth_mm, "ndim", 0) >= 2:
+            nose = face14.get("鼻尖")
+            if nose is not None:
+                depth_x, depth_y = color_to_depth_point(
+                    nose[0], nose[1], img_bgr.shape, depth_mm.shape)
+                distance_mm = get_distance(depth_mm, depth_x, depth_y)
+                if distance_mm > 0.0:
+                    distance_cm = distance_mm / 10.0
+        return face14, face_box, float(score), distance_cm
 
     def release(self):
         """当前 ais_bench 无 free_resource，按已验证方式删除会话引用。"""

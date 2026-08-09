@@ -4,6 +4,7 @@ from PyQt5.QtWidgets import QApplication
 
 from inference.gesture_infer import draw
 from inference.gesture_worker import GestureWorker
+from ui.draw_utils import draw_text_box_bgr
 
 from .base_page import BasePage
 
@@ -18,6 +19,7 @@ class GesturePage(BasePage):
         self._active = False
         self._latest_lm = None
         self._latest_gesture = ""
+        self._latest_distance_cm = None
         self._status_text = "手势模型加载中..."
         self._stop_requested = False
         self._restart_when_finished = False
@@ -30,10 +32,18 @@ class GesturePage(BasePage):
 
     def process_frame(self, bgr_frame, depth_frame=None):
         if self._worker is not None:
-            self._worker.submit_frame(bgr_frame)
+            self._worker.submit_frame(bgr_frame, depth_frame)
         if self._latest_lm is None or not self._stable_gesture:
             return bgr_frame, self._status_text
-        return draw(bgr_frame.copy(), self._latest_lm, self._stable_gesture), self._status_text
+        rendered = draw(bgr_frame.copy(), self._latest_lm,
+                        self._stable_gesture)
+        if (self._latest_distance_cm is not None
+                and self._latest_distance_cm > 0.0):
+            rendered = draw_text_box_bgr(
+                rendered, "距离 %.1f cm" % self._latest_distance_cm,
+                20, 68, font_size=15, text_color=(8, 19, 31),
+                background_color=(74, 158, 255))
+        return rendered, self._status_text
 
     def on_activated(self):
         self._active = True
@@ -46,6 +56,7 @@ class GesturePage(BasePage):
         self._active = False
         self._latest_lm = None
         self._latest_gesture = ""
+        self._latest_distance_cm = None
         self._stable_gesture = ""
         self._pending_gesture = None
         self._pending_count = 0
@@ -70,10 +81,11 @@ class GesturePage(BasePage):
     def _on_status(self, text):
         self._status_text = text
 
-    def _on_result(self, lm, gesture, conf, status):
+    def _on_result(self, lm, gesture, conf, distance_cm, status):
         if not self._active or self._stop_requested:
             return
         self._latest_lm = lm
+        self._latest_distance_cm = distance_cm
         if gesture:
             if gesture == self._pending_gesture:
                 self._pending_count += 1
@@ -93,6 +105,7 @@ class GesturePage(BasePage):
 
     def _on_error(self, text):
         self._latest_lm = None
+        self._latest_distance_cm = None
         self._stable_gesture = ""
         self._status_text = text
 

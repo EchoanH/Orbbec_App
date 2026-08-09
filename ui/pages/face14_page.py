@@ -8,6 +8,7 @@ from PyQt5.QtWidgets import QApplication
 
 from inference.face14_infer import draw_face14
 from inference.face14_worker import Face14Worker
+from ui.draw_utils import draw_text_box_bgr
 
 from .base_page import BasePage
 
@@ -33,6 +34,7 @@ class Face14Page(BasePage):
         self._latest_face14 = None
         self._latest_face_box = None
         self._latest_score = 0.0
+        self._latest_distance_cm = None
         self._display_face14 = None
         self._smoothing_tick_ns = None
         self._status_text = "模型加载中..."
@@ -50,12 +52,22 @@ class Face14Page(BasePage):
 
     def process_frame(self, bgr_frame, depth_frame=None):
         if self._worker is not None:
-            self._worker.submit_frame(bgr_frame)
+            self._worker.submit_frame(bgr_frame, depth_frame)
         try:
             display_face14 = (self._update_display_face14()
                               if self._latest_face14 is not None else None)
-            return draw_face14(bgr_frame, display_face14,
-                               self._latest_face_box, self._latest_score), self._status_text
+            rendered = draw_face14(bgr_frame, display_face14,
+                                   self._latest_face_box, self._latest_score)
+            if (self._latest_distance_cm is not None
+                    and self._latest_distance_cm > 0.0
+                    and self._latest_face_box is not None):
+                x1, y1 = self._latest_face_box[:2]
+                rendered = draw_text_box_bgr(
+                    rendered, "距离 %.1f cm" % self._latest_distance_cm,
+                    x1, y1 - 62, font_size=15,
+                    text_color=(8, 19, 31),
+                    background_color=(74, 158, 255))
+            return rendered, self._status_text
         except Exception as exc:
             message = "关键点绘制异常：%s" % exc
             if message != self._last_draw_error:
@@ -75,6 +87,7 @@ class Face14Page(BasePage):
         self._latest_face14 = None
         self._latest_face_box = None
         self._latest_score = 0.0
+        self._latest_distance_cm = None
         self._display_face14 = None
         self._smoothing_tick_ns = None
         self._restart_when_finished = False
@@ -100,12 +113,14 @@ class Face14Page(BasePage):
     def _on_status(self, text):
         self._status_text = text
 
-    def _on_result(self, face14, face_box, score, elapsed_ms, text):
+    def _on_result(self, face14, face_box, score, distance_cm, elapsed_ms,
+                   text):
         if not self._active or self._worker_stop_requested:
             return
         self._latest_face14 = face14
         self._latest_face_box = face_box
         self._latest_score = score
+        self._latest_distance_cm = distance_cm
         if face14 is None:
             self._display_face14 = None
             self._smoothing_tick_ns = None
@@ -120,6 +135,7 @@ class Face14Page(BasePage):
         self._latest_face14 = None
         self._latest_face_box = None
         self._latest_score = 0.0
+        self._latest_distance_cm = None
         self._display_face14 = None
         self._smoothing_tick_ns = None
         self._status_text = text

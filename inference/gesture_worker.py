@@ -17,7 +17,7 @@ PERF = get_perf_logger()
 
 class GestureWorker(QThread):
     status_ready = pyqtSignal(str)
-    result_ready = pyqtSignal(object, str, float, str)
+    result_ready = pyqtSignal(object, str, float, object, str)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -28,11 +28,11 @@ class GestureWorker(QThread):
         self._last_error = None
         self._inference_timestamps = deque(maxlen=10)
 
-    @pyqtSlot(object)
-    def submit_frame(self, bgr_frame):
+    @pyqtSlot(object, object)
+    def submit_frame(self, bgr_frame, depth_frame):
         if not self._running:
             return
-        item = (bgr_frame, time.perf_counter_ns())
+        item = (bgr_frame, depth_frame, time.perf_counter_ns())
         try:
             self._queue.put_nowait(item)
         except Full:
@@ -59,12 +59,13 @@ class GestureWorker(QThread):
             self.status_ready.emit("手势模型已就绪")
             while self._running:
                 try:
-                    bgr_frame, submitted_ns = self._queue.get(timeout=0.1)
+                    bgr_frame, depth_frame, submitted_ns = self._queue.get(timeout=0.1)
                 except Empty:
                     continue
                 started_ns = time.perf_counter_ns()
                 try:
-                    lm, gesture, conf, detail = self._engine.infer(bgr_frame)
+                    lm, gesture, conf, distance_cm, detail = self._engine.infer(
+                        bgr_frame, depth_frame)
                     elapsed_ms = (time.perf_counter_ns() - started_ns) / 1e6
                     self._inference_timestamps.append(time.perf_counter_ns())
                     update_rate = "检测更新 -- Hz"
@@ -75,7 +76,8 @@ class GestureWorker(QThread):
                     PERF.event("手势单帧推理完成", elapsed_ms)
                     self._last_error = None
                     status = "%s · %s" % (detail, update_rate)
-                    self.result_ready.emit(lm, gesture or "", conf, status)
+                    self.result_ready.emit(lm, gesture or "", conf,
+                                           distance_cm, status)
                 except Exception as exc:
                     message = "手势推理异常：%s" % exc
                     if message != self._last_error:
