@@ -51,10 +51,9 @@ class Face14Page(BasePage):
     def process_frame(self, bgr_frame, depth_frame=None):
         if self._worker is not None:
             self._worker.submit_frame(bgr_frame)
-        if self._latest_face14 is None:
-            return bgr_frame, self._status_text
         try:
-            display_face14 = self._update_display_face14()
+            display_face14 = (self._update_display_face14()
+                              if self._latest_face14 is not None else None)
             return draw_face14(bgr_frame, display_face14,
                                self._latest_face_box, self._latest_score), self._status_text
         except Exception as exc:

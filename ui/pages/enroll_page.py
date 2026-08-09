@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFrame,
 
 from inference.enroll_worker import EnrollWorker
 from inference.face_db_adapter import delete_person, list_enrolled
+from inference.face14_infer import draw_face_guide
 
 from .base_page import BasePage
 
@@ -107,16 +108,16 @@ class EnrollPage(BasePage):
     def process_frame(self, bgr_frame, depth_frame=None):
         if self._worker is not None:
             self._worker.submit_frame(bgr_frame)
-        if self._latest_box is None:
-            return bgr_frame, self._status_text
-        box = self._update_display_box()
-        label = self._stable_name or "识别中"
-        if self._stable_name:
-            label = "%s %.2f · conf %.3f" % (
-                self._stable_name, self._latest_similarity,
-                self._latest_detection_score)
-        else:
-            label = "识别中 · conf %.3f" % self._latest_detection_score
+        box = self._update_display_box() if self._latest_box is not None else None
+        label = None
+        if box is not None:
+            label = self._stable_name or "识别中"
+            if self._stable_name:
+                label = "%s %.2f · conf %.3f" % (
+                    self._stable_name, self._latest_similarity,
+                    self._latest_detection_score)
+            else:
+                label = "识别中 · conf %.3f" % self._latest_detection_score
         return self._draw_match(bgr_frame, box, label), self._status_text
 
     def on_activated(self):
@@ -295,7 +296,10 @@ class EnrollPage(BasePage):
 
     @staticmethod
     def _draw_match(bgr_frame, box, label):
-        canvas = np.ascontiguousarray(bgr_frame.copy())
+        canvas = draw_face_guide(bgr_frame)
+        if box is None or label is None:
+            return canvas
+        canvas = np.ascontiguousarray(canvas)
         height, width = canvas.shape[:2]
         rgb = canvas[:, :, ::-1].copy()
         image = QImage(rgb.data, width, height, int(rgb.strides[0]),

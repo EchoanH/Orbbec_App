@@ -32,6 +32,20 @@ PART_COLOR = {
 }
 FACE_BOX_COLOR = (255, 158, 74)
 FACE_BOX_TEXT_COLOR = (31, 19, 8)
+GUIDE_COLOR = (220, 220, 220)
+
+
+def draw_face_guide(img_bgr):
+    """在画面中央叠加静态人脸距离引导框，不读取任何推理结果。"""
+    canvas = img_bgr.copy()
+    height, width = canvas.shape[:2]
+    guide_width = max(180, min(350, int(width * 0.30)))
+    guide_height = max(240, min(430, int(height * 0.58)))
+    center = (width // 2, int(height * 0.45))
+    axes = (guide_width // 2, guide_height // 2)
+    overlay = canvas.copy()
+    cv2.ellipse(overlay, center, axes, 0, 0, 360, GUIDE_COLOR, 2, cv2.LINE_AA)
+    return cv2.addWeighted(overlay, 0.45, canvas, 0.55, 0.0)
 
 torch = None
 InferSession = None
@@ -203,8 +217,10 @@ def yunet_get_facebox(sess_yunet, idx, img_bgr):
 
 
 # 只调整可视化内容：人脸框 + 置信度 + 五色关键点，不连接关键点。
-def draw_face14(img_bgr, face14, face_box, score):
-    canvas = img_bgr.copy()
+def draw_face14(img_bgr, face14=None, face_box=None, score=None):
+    canvas = draw_face_guide(img_bgr)
+    if face14 is None or face_box is None or score is None:
+        return canvas
     height, width = canvas.shape[:2]
     x1, y1, x2, y2 = [int(v) for v in face_box]
     x1 = max(0, min(width - 1, x1))
