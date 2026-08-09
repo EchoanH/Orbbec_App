@@ -22,11 +22,11 @@ class Face14Worker(QThread):
     result_ready = pyqtSignal(object, float, float, str)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, yunet_session, parent=None):
         super(Face14Worker, self).__init__(parent)
         self._queue = Queue(maxsize=1)
         self._running = False
-        self._engine = Face14Engine()
+        self._engine = Face14Engine(yunet_session)
         self._last_error = None
         self._dropped_count = 0
         self._inference_timestamps = deque(maxlen=10)

@@ -7,6 +7,7 @@ import sys
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QApplication
 
+from inference.yunet_session import YuNetSession
 from perf_logging import get_perf_logger
 from style.theme import APP_STYLE
 from ui.main_window import MainWindow
@@ -27,7 +28,9 @@ def main():
     app.setApplicationName("AI 综合实验箱")
     app.setFont(QFont("Droid Sans Fallback", 11))
     app.setStyleSheet(APP_STYLE)
-    window = MainWindow()
+    yunet_session = YuNetSession()
+    window = MainWindow(yunet_session)
+    app.aboutToQuit.connect(yunet_session.release)
     window.showFullScreen()
     return app.exec_()
 

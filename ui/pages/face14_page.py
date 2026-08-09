@@ -25,8 +25,9 @@ class Face14Page(BasePage):
     page_title = "人脸关键点检测"
     page_hint = "14 关键点 · NPU 实时推理"
 
-    def __init__(self, parent=None):
+    def __init__(self, yunet_session, parent=None):
         super(Face14Page, self).__init__(parent)
+        self._yunet_session = yunet_session
         self._worker = None
         self._active = False
         self._latest_face14 = None
@@ -76,13 +77,15 @@ class Face14Page(BasePage):
         if self._worker is not None:
             self._worker_stop_requested = True
             self._worker.stop()
+            if self._worker.isRunning():
+                self._worker.wait()
 
     def _start_worker(self):
         self._status_text = "模型加载中..."
         self._worker_failed = False
         self._worker_stop_requested = False
         self._restart_when_finished = False
-        worker = Face14Worker(self)
+        worker = Face14Worker(self._yunet_session, self)
         worker.status_ready.connect(self._on_status)
         worker.result_ready.connect(self._on_result)
         worker.error_occurred.connect(self._on_error)

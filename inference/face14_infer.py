@@ -1,5 +1,6 @@
 """人脸 14 关键点推理：算法函数原样来自已验证的 38_face14_demo.py。"""
 
+import gc
 import os
 import time
 from importlib.util import module_from_spec, spec_from_file_location
@@ -220,8 +221,8 @@ def draw_face14(img_bgr, face14):
 class Face14Engine(object):
     """持有两段模型会话；算法函数之外只负责加载、串联与释放。"""
 
-    def __init__(self):
-        self.sess_yunet = None
+    def __init__(self, yunet_session):
+        self.sess_yunet = yunet_session
         self.sess_landmark = None
         self.yunet_idx = None
         self.yunet_index_mode = ""
@@ -249,7 +250,7 @@ class Face14Engine(object):
         extract_face14 = _face14.extract_face14
         FACE14_BY_PART = _face14.FACE14_BY_PART
 
-        self.sess_yunet = InferSession(0, YUNET_OM)
+        self.sess_yunet.load()
         self.sess_landmark = InferSession(0, LANDMARK_OM)
         self.yunet_idx, self.yunet_index_mode = yunet_build_index(self.sess_yunet)
 
@@ -286,7 +287,5 @@ class Face14Engine(object):
         if self.sess_landmark is not None:
             del self.sess_landmark
             self.sess_landmark = None
-        if self.sess_yunet is not None:
-            del self.sess_yunet
-            self.sess_yunet = None
+            gc.collect()
         self.yunet_idx = None

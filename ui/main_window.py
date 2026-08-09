@@ -34,7 +34,7 @@ class MainWindow(QMainWindow):
         ("人脸录入", "enroll"),
     ]
 
-    def __init__(self):
+    def __init__(self, yunet_session):
         super(MainWindow, self).__init__()
         self.setWindowTitle("AI 综合实验箱")
         self.setWindowFlags(Qt.FramelessWindowHint)
@@ -42,7 +42,9 @@ class MainWindow(QMainWindow):
         self.capture_thread = CaptureThread(self.source, self)
         self.inference_thread = InferenceThread(self)
         self._perf_last_ui_frame_ns = None
-        self.pages = [Face14Page(), PedestrianPage(), GesturePage(), EnrollPage()]
+        self.yunet_session = yunet_session
+        self.pages = [Face14Page(self.yunet_session), PedestrianPage(),
+                      GesturePage(), EnrollPage(self.yunet_session)]
         self.nav_buttons = []
         self._build_ui()
         self.capture_thread.frame_ready.connect(self.inference_thread.submit_frame)
