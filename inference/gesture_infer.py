@@ -202,9 +202,9 @@ def draw(vis, lm, g):
         cv2.circle(vis, tuple(p[i]), 8, (0,0,255), 2)
         cv2.putText(vis, str(i), (p[i][0]+8, p[i][1]-8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-    x, y = p[:,0].min(), p[:,1].min()
-    cv2.putText(vis, g, (max(0,x), max(24,y-12)),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 3)
+    if g and g != "未知":
+        cv2.putText(vis, g, (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0,0,255), 4)
     return vis
 
 
