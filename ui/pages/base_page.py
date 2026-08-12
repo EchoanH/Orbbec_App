@@ -4,7 +4,6 @@ import time
 from collections import deque
 from typing import Optional, Tuple
 
-import cv2
 import numpy as np
 from PyQt5.QtCore import QSize, Qt
 from PyQt5.QtGui import QImage, QPixmap
@@ -15,7 +14,6 @@ from perf_logging import get_perf_logger
 
 PERF = get_perf_logger()
 UI_TIMESTAMPS = deque(maxlen=10)
-FAST_RESIZE_ENABLED = True
 
 
 class PerfVideoLabel(QLabel):
@@ -48,9 +46,6 @@ class BasePage(QWidget):
     def __init__(self, parent=None):
         super(BasePage, self).__init__(parent)
         self._last_pixmap = None
-        self._cached_pixmap = None
-        self._cached_pixmap_target_size = None
-        self._last_video_label_size = None
         self.video_label = PerfVideoLabel()
         self.video_label.setObjectName("videoLabel")
         self.video_label.setAlignment(Qt.AlignCenter)
@@ -75,39 +70,26 @@ class BasePage(QWidget):
     def on_deactivated(self):
         pass
 
+    # P0 UI 渲染性能优化：绘制前先降采样，坐标同步缩放。
+    def compute_target_size(self, source_width, source_height):
+        """按视频画布等比计算目标尺寸，并返回宽度缩放比例。"""
+        source_width = int(source_width)
+        source_height = int(source_height)
+        if source_width <= 0 or source_height <= 0:
+            return max(1, source_width), max(1, source_height), 1.0
+        label_size = self.video_label.size()
+        if label_size.width() <= 0 or label_size.height() <= 0:
+            return source_width, source_height, 1.0
+        fitted_size = QSize(source_width, source_height).scaled(
+            label_size, Qt.KeepAspectRatio)
+        target_width = max(1, fitted_size.width())
+        target_height = max(1, fitted_size.height())
+        return target_width, target_height, target_width / float(source_width)
+
     def show_frame(self, bgr_frame: Optional[np.ndarray]):
         if bgr_frame is None or getattr(bgr_frame, "size", 0) == 0:
             return
         frame = bgr_frame
-        source_height, source_width = frame.shape[:2]
-        target_size = self.video_label.size()
-        target_size_key = (target_size.width(), target_size.height())
-        target_changed = target_size_key != self._last_video_label_size
-        self._last_video_label_size = target_size_key
-        fitted_size = QSize(source_width, source_height).scaled(
-            target_size, Qt.KeepAspectRatio)
-        resize_started_ns = time.perf_counter_ns()
-        if (FAST_RESIZE_ENABLED and fitted_size.width() > 0
-                and fitted_size.height() > 0
-                and (fitted_size.width() < source_width
-                     or fitted_size.height() < source_height)):
-            frame = cv2.resize(
-                frame, (fitted_size.width(), fitted_size.height()),
-                interpolation=cv2.INTER_LINEAR)
-            PERF.event("UI cv2源帧缩放",
-                       (time.perf_counter_ns() - resize_started_ns) / 1e6,
-                       "mode=INTER_LINEAR source=%sx%s target=%sx%s "
-                       "label_changed=%s" % (
-                           source_width, source_height,
-                           fitted_size.width(), fitted_size.height(),
-                           target_changed))
-        else:
-            PERF.event("UI cv2源帧缩放", 0.0,
-                       "mode=skipped source=%sx%s target=%sx%s enabled=%s "
-                       "label_changed=%s" % (
-                           source_width, source_height,
-                           fitted_size.width(), fitted_size.height(),
-                           FAST_RESIZE_ENABLED, target_changed))
         copied = False
         if not frame.flags["C_CONTIGUOUS"]:
             frame = np.ascontiguousarray(frame)
@@ -132,13 +114,6 @@ class BasePage(QWidget):
                    "bytesPerLine=%d copy=%s" % (int(frame.strides[0]), copied))
         pixmap_started_ns = time.perf_counter_ns()
         self._last_pixmap = QPixmap.fromImage(image)
-        self._cached_pixmap = None
-        self._cached_pixmap_target_size = None
-        if (FAST_RESIZE_ENABLED and target_size.width() > 0
-                and target_size.height() > 0
-                and self._last_pixmap.size() == fitted_size):
-            self._cached_pixmap = self._last_pixmap
-            self._cached_pixmap_target_size = target_size_key
         pixmap_finished_ns = time.perf_counter_ns()
         PERF.event("UI QImage转QPixmap",
                    (pixmap_finished_ns - pixmap_started_ns) / 1e6)
@@ -152,25 +127,12 @@ class BasePage(QWidget):
         if self._last_pixmap is not None:
             scale_started_ns = time.perf_counter_ns()
             target_size = self.video_label.size()
-            target_size_key = (target_size.width(), target_size.height())
-            cache_hit = (
-                FAST_RESIZE_ENABLED
-                and self._cached_pixmap is not None
-                and self._cached_pixmap_target_size == target_size_key)
-            if cache_hit:
-                scaled = self._cached_pixmap
-            else:
-                scaled = self._last_pixmap.scaled(
-                    target_size, Qt.KeepAspectRatio, Qt.FastTransformation)
-                if FAST_RESIZE_ENABLED:
-                    self._cached_pixmap = scaled
-                    self._cached_pixmap_target_size = target_size_key
+            scaled = self._last_pixmap.scaled(
+                target_size, Qt.KeepAspectRatio, Qt.FastTransformation)
             scale_finished_ns = time.perf_counter_ns()
             PERF.event("UI QPixmap缩放",
                        (scale_finished_ns - scale_started_ns) / 1e6,
-                       "mode=%s cache_hit=%s transformation=%s target=%sx%s" % (
-                           "cached" if cache_hit else "scaled", cache_hit,
-                           "none" if cache_hit else "FastTransformation",
+                       "mode=scaled transformation=FastTransformation target=%sx%s" % (
                            self.video_label.width(), self.video_label.height()))
             set_started_ns = time.perf_counter_ns()
             self.video_label.setPixmap(scaled)

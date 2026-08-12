@@ -1,5 +1,6 @@
 """手势识别演示页。"""
 
+import cv2
 from PyQt5.QtWidgets import QApplication
 
 from inference.gesture_infer import draw
@@ -33,10 +34,19 @@ class GesturePage(BasePage):
     def process_frame(self, bgr_frame, depth_frame=None):
         if self._worker is not None:
             self._worker.submit_frame(bgr_frame, depth_frame)
+        # P0 UI 渲染性能优化：绘制前先降采样，坐标同步缩放。
+        height, width = bgr_frame.shape[:2]
+        target_width, target_height, scale = self.compute_target_size(
+            width, height)
+        small_frame = cv2.resize(
+            bgr_frame, (target_width, target_height),
+            interpolation=cv2.INTER_LINEAR)
         if self._latest_lm is None or not self._stable_gesture:
-            return bgr_frame, self._status_text
-        rendered = draw(bgr_frame.copy(), self._latest_lm,
-                        self._stable_gesture)
+            return small_frame, self._status_text
+        lm_scaled = self._latest_lm.copy()
+        lm_scaled[:, 0] *= scale
+        lm_scaled[:, 1] *= scale
+        rendered = draw(small_frame.copy(), lm_scaled, self._stable_gesture)
         if (self._latest_distance_cm is not None
                 and self._latest_distance_cm > 0.0):
             rendered = draw_text_box_bgr(

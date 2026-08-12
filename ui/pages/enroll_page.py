@@ -5,6 +5,7 @@ import math
 import time
 import traceback
 
+import cv2
 import numpy as np
 from PyQt5.QtCore import Qt, QRectF
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen
@@ -120,7 +121,18 @@ class EnrollPage(BasePage):
     def process_frame(self, bgr_frame, depth_frame=None):
         if self._worker is not None:
             self._worker.submit_frame(bgr_frame)
+        # P0 UI 渲染性能优化：绘制前先降采样，坐标同步缩放。
+        height, width = bgr_frame.shape[:2]
+        target_width, target_height, scale = self.compute_target_size(
+            width, height)
+        small_frame = cv2.resize(
+            bgr_frame, (target_width, target_height),
+            interpolation=cv2.INTER_LINEAR)
         box = self._update_display_box() if self._latest_box is not None else None
+        box_scaled = None
+        if box is not None:
+            box_scaled = box.copy()
+            box_scaled *= scale
         label = None
         if box is not None:
             label = self._stable_name or "识别中"
@@ -130,7 +142,7 @@ class EnrollPage(BasePage):
                     self._latest_detection_score)
             else:
                 label = "识别中 · conf %.3f" % self._latest_detection_score
-        return self._draw_match(bgr_frame, box, label), self._status_text
+        return self._draw_match(small_frame, box_scaled, label), self._status_text
 
     def on_activated(self):
         started_ns = time.perf_counter_ns()

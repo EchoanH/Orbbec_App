@@ -4,6 +4,7 @@ import logging
 import math
 import time
 
+import cv2
 from PyQt5.QtWidgets import QApplication
 
 from inference.face14_infer import draw_face14
@@ -53,15 +54,32 @@ class Face14Page(BasePage):
     def process_frame(self, bgr_frame, depth_frame=None):
         if self._worker is not None:
             self._worker.submit_frame(bgr_frame, depth_frame)
+        # P0 UI 渲染性能优化：绘制前先降采样，坐标同步缩放。
+        height, width = bgr_frame.shape[:2]
+        target_width, target_height, scale = self.compute_target_size(
+            width, height)
+        small_frame = cv2.resize(
+            bgr_frame, (target_width, target_height),
+            interpolation=cv2.INTER_LINEAR)
         try:
             display_face14 = (self._update_display_face14()
                               if self._latest_face14 is not None else None)
-            rendered = draw_face14(bgr_frame, display_face14,
-                                   self._latest_face_box, self._latest_score)
+            face14_scaled = None
+            if display_face14 is not None:
+                face14_scaled = {
+                    name: (point[0] * scale, point[1] * scale)
+                    for name, point in display_face14.items()
+                }
+            face_box_scaled = None
+            if self._latest_face_box is not None:
+                face_box_scaled = [value * scale
+                                   for value in self._latest_face_box]
+            rendered = draw_face14(small_frame, face14_scaled,
+                                   face_box_scaled, self._latest_score)
             if (self._latest_distance_cm is not None
                     and self._latest_distance_cm > 0.0
-                    and self._latest_face_box is not None):
-                x1, y1 = self._latest_face_box[:2]
+                    and face_box_scaled is not None):
+                x1, y1 = face_box_scaled[:2]
                 rendered = draw_text_box_bgr(
                     rendered, "距离 %.1f cm" % self._latest_distance_cm,
                     x1, y1 - 62, font_size=15,
@@ -73,7 +91,7 @@ class Face14Page(BasePage):
             if message != self._last_draw_error:
                 LOGGER.exception(message)
                 self._last_draw_error = message
-            return bgr_frame, message
+            return small_frame, message
 
     def on_activated(self):
         self._active = True

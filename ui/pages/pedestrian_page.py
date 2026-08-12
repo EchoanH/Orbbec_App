@@ -2,6 +2,7 @@
 
 import logging
 
+import cv2
 from PyQt5.QtWidgets import QApplication
 
 from inference.pedestrian_infer import draw_pedestrians
@@ -33,9 +34,20 @@ class PedestrianPage(BasePage):
     def process_frame(self, bgr_frame, depth_frame=None):
         if self._worker is not None:
             self._worker.submit_frame(bgr_frame)
+        # P0 UI 渲染性能优化：绘制前先降采样，坐标同步缩放。
+        height, width = bgr_frame.shape[:2]
+        target_width, target_height, scale = self.compute_target_size(
+            width, height)
+        small_frame = cv2.resize(
+            bgr_frame, (target_width, target_height),
+            interpolation=cv2.INTER_LINEAR)
         if not self._latest_dets:
-            return bgr_frame, self._status_text
-        return draw_pedestrians(bgr_frame, self._latest_dets), self._status_text
+            return small_frame, self._status_text
+        scaled_dets = [
+            (name, score, [value * scale for value in box])
+            for name, score, box in self._latest_dets
+        ]
+        return draw_pedestrians(small_frame, scaled_dets), self._status_text
 
     def on_activated(self):
         self._active = True
