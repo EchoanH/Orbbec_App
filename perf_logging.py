@@ -8,7 +8,14 @@ import time
 from collections import defaultdict
 from queue import Empty, Full, Queue
 
-#VERBOSE = False
+
+# 逐帧事件开关。默认关闭：诊断阶段实测每 102 秒产生 36975 条事件（362 条/秒），
+# 每条都要格式化字符串、入队、写盘并 print，在仅 3 个可用核的板子上是明显负担。
+# 关闭后仍保留 increment/set_gauge 计数与五秒汇总，只是不再逐帧记录明细。
+# 需要重新诊断时无需改代码，设环境变量即可：
+#     PERF_VERBOSE=1 bash run.sh
+VERBOSE = os.environ.get("PERF_VERBOSE", "0") not in ("0", "", "false", "False")
+
 
 class _PerfStats(object):
     """跨线程共享的轻量计数器与仪表值。"""
@@ -38,6 +45,7 @@ class PerfLogger(object):
     def __init__(self):
         self.stats = _PerfStats()
         self.display = os.environ.get("DISPLAY", "<未设置>")
+        self.verbose = VERBOSE
         root = os.path.dirname(os.path.abspath(__file__))
         log_dir = os.path.join(root, "logs")
         if not os.path.exists(log_dir):
@@ -57,8 +65,14 @@ class PerfLogger(object):
         atexit.register(self.close)
 
     def event(self, name, elapsed_ms=0.0, detail="", level="INFO"):
-        """非阻塞记录事件；队列满时丢弃日志而不影响业务线程。"""
+        """非阻塞记录事件；队列满时丢弃日志而不影响业务线程。
+
+        verbose 关闭时直接返回，连元组构造与线程名查询都不做。
+        WARNING 级别不受开关影响，异常信息始终保留。
+        """
         if self._closed:
+            return
+        if not self.verbose and level != "WARNING":
             return
         item = (time.time(), threading.current_thread().name, name,
                 float(elapsed_ms or 0.0), detail, level)
@@ -106,11 +120,11 @@ class PerfLogger(object):
         face14_dropped = counters.get("face14_queue_dropped", 0)
         pipeline_dropped = counters.get("pipeline_queue_dropped", 0)
         detail = (
-            "DISPLAY=%s 采集FPS=%.1f 推理FPS=%.1f UI渲染FPS=%.1f "
+            "DISPLAY=%s verbose=%s 采集FPS=%.1f 推理FPS=%.1f UI渲染FPS=%.1f "
             "队列积压=%d(face14=%d,通用=%d) 主动跳帧=%d(face14=%d,通用=%d) "
             "异常丢帧=0 日志丢弃=%d" % (
-                self.display, capture_fps, infer_fps, ui_fps, queue_depth,
-                face14_queue_depth, pipeline_queue_depth,
+                self.display, self.verbose, capture_fps, infer_fps, ui_fps,
+                queue_depth, face14_queue_depth, pipeline_queue_depth,
                 face14_dropped + pipeline_dropped, face14_dropped, pipeline_dropped,
                 counters.get("perf_log_dropped", 0)))
         return self._format((time.time(), threading.current_thread().name,
@@ -140,7 +154,9 @@ class PerfLogger(object):
             try:
                 self._file.flush()
             except Exception:
-                self._file = None
+                pass
+        if self._file is None:
+            return
 
     def close(self):
         if self._closed:
@@ -173,6 +189,6 @@ def get_perf_logger():
         with _LOGGER_LOCK:
             if _LOGGER is None:
                 _LOGGER = PerfLogger()
-                _LOGGER.event("性能日志启动", detail="DISPLAY=%s 文件=%s" % (
-                    _LOGGER.display, _LOGGER.path))
+                _LOGGER.event("性能日志启动", detail="DISPLAY=%s verbose=%s 文件=%s" % (
+                    _LOGGER.display, _LOGGER.verbose, _LOGGER.path))
     return _LOGGER

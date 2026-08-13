@@ -22,10 +22,11 @@ from ui.pages.pedestrian_page import PedestrianPage
 LOGGER = logging.getLogger(__name__)
 PERF = get_perf_logger()
 
-# 渲染节拍：主线程按此间隔取最新帧渲染。33ms 约 30fps 上限；
-# 主线程若来不及，下一拍自然跳过中间帧，不会在 Qt 事件队列里堆积。
-RENDER_INTERVAL_MS = 33
-
+# 渲染节拍：主线程按此间隔取最新帧渲染。
+# 20ms(50Hz) 快于相机的 33.3ms 出帧间隔，确保每帧到达后都能在下一拍被取走；
+# QTimer 是"最少间隔"而非精确调度，设成 33 会因抖动错过整拍，实测掉到 22fps。
+# 没有新帧时 _render_latest 直接返回，空转成本可忽略。
+RENDER_INTERVAL_MS = 16
 
 class MainWindow(QMainWindow):
     """应用壳层；所有页面共享一个采集线程，切页不重启摄像头。"""
