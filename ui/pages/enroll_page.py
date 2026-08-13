@@ -16,7 +16,6 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFrame,
 
 from inference.enroll_worker import EnrollWorker
 from inference.face_db_adapter import delete_person, list_enrolled
-from inference.face14_infer import draw_face_guide
 from perf_logging import get_perf_logger
 
 from .base_page import BasePage
@@ -26,6 +25,15 @@ SMOOTHING_TAU_MS = 30.0
 NAME_STABLE_FRAMES = 3
 LOGGER = logging.getLogger(__name__)
 PERF = get_perf_logger()
+
+# 推理节流：与 face14_page 相同的闸门参数，限制向推理 worker 提交帧的频率。
+INFERENCE_FPS_LIMIT = 10.0
+# 容差系数：闸门间隔取目标间隔的 85%。帧到达时刻是离散的（33.3ms 一格），
+# 若阈值卡得刚好，抖动会让每隔一次都差几毫秒不达标，实际频率直接腰斩
+# （实测 10Hz 设定跑出 5.2Hz）。留 15% 容差可吸收抖动。
+_SUBMIT_TOLERANCE = 0.85
+_MIN_SUBMIT_INTERVAL_NS = (int(1e9 / INFERENCE_FPS_LIMIT * _SUBMIT_TOLERANCE)
+                           if INFERENCE_FPS_LIMIT > 0 else 0)
 
 
 def _log_page_exception(stage, exc):
@@ -56,6 +64,8 @@ class EnrollPage(BasePage):
         self._pending_count = 0
         self._stable_name = ""
         self._enrolling = False
+        self._last_submit_ns = 0
+        self._submit_skipped = 0
         self._build_controls()
         self._refresh_people()
         app = QApplication.instance()
@@ -118,21 +128,54 @@ class EnrollPage(BasePage):
         outer.addLayout(people, 3)
         self.layout().addWidget(panel)
 
-    def process_frame(self, bgr_frame, depth_frame=None):
-        if self._worker is not None:
+    def _should_submit(self):
+        """推理节流闸门：距上次提交不足最小间隔时跳过，不占用推理算力。
+
+        以"提交时刻"而非"结果返回时刻"为基准，且带 15% 容差，避免与
+        离散的帧到达时刻发生拍频。
+        """
+        if _MIN_SUBMIT_INTERVAL_NS <= 0:
+            return True
+        now_ns = time.perf_counter_ns()
+        if now_ns - self._last_submit_ns < _MIN_SUBMIT_INTERVAL_NS:
+            self._submit_skipped += 1
+            return False
+        self._last_submit_ns = now_ns
+        return True
+
+    def process_frame(self, bgr_frame, bgr_display=None, depth_frame=None):
+        if self._worker is not None and self._should_submit():
+            # 推理永远送原始 1280x720 帧，显示放大不参与推理链路。
             self._worker.submit_frame(bgr_frame)
-        # P0 UI 渲染性能优化：绘制前先降采样，坐标同步缩放。
-        height, width = bgr_frame.shape[:2]
-        target_width, target_height, scale = self.compute_target_size(
-            width, height)
-        small_frame = cv2.resize(
-            bgr_frame, (target_width, target_height),
-            interpolation=cv2.INTER_LINEAR)
+        # 绘制底图用采集线程预放大的显示帧；为 None 时回退原始帧。
+        display_frame = (bgr_display if bgr_display is not None
+                         else bgr_frame)
+        # 两级缩放：display_scale（原始帧 -> 显示帧，宽高独立）与
+        # target_scale（显示帧 -> 画布，等比，仅画布小于显示帧时才 <1）。
+        scale_x, scale_y = self.compute_display_scale(
+            bgr_frame.shape, display_frame.shape)
+        display_height, display_width = display_frame.shape[:2]
+        target_width, target_height, target_scale = self.compute_target_size(
+            display_width, display_height)
+        if target_scale >= 1.0:
+            # 画布不小于显示帧：跳过 cv2.resize，直接用显示帧。
+            # 修复原有 bug：此前无条件 resize 会在 scale=1.0 时对每帧做
+            # 一次同尺寸全帧拷贝。
+            small_frame = display_frame
+        else:
+            small_frame = cv2.resize(
+                display_frame, (target_width, target_height),
+                interpolation=cv2.INTER_LINEAR)
         box = self._update_display_box() if self._latest_box is not None else None
         box_scaled = None
         if box is not None:
             box_scaled = box.copy()
-            box_scaled *= scale
+            # box 为 [x1, y1, x2, y2]：x 项乘 scale_x，y 项乘 scale_y，
+            # 再统一乘 target_scale。
+            box_scaled[0] *= scale_x * target_scale
+            box_scaled[2] *= scale_x * target_scale
+            box_scaled[1] *= scale_y * target_scale
+            box_scaled[3] *= scale_y * target_scale
         label = None
         if box is not None:
             label = self._stable_name or "识别中"
@@ -148,6 +191,7 @@ class EnrollPage(BasePage):
         started_ns = time.perf_counter_ns()
         PERF.event("EnrollPage activate start", detail="active=True")
         self._active = True
+        self._last_submit_ns = 0
         try:
             self._refresh_people()
             if self._worker is None:
@@ -381,7 +425,10 @@ class EnrollPage(BasePage):
 
     @staticmethod
     def _draw_match(bgr_frame, box, label):
-        canvas = draw_face_guide(bgr_frame)
+        # 引导椭圆已取消（用户确认不再需要）：draw_face_guide 内部含
+        # canvas.copy + overlay.copy + addWeighted 三次全帧运算，直接使用
+        # 传入帧，视觉输出仅少了引导椭圆，其余 QPainter 绘制不变。
+        canvas = bgr_frame
         if box is None or label is None:
             return canvas
         canvas = np.ascontiguousarray(canvas)

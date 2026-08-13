@@ -1,5 +1,7 @@
 """手势识别演示页。"""
 
+import time
+
 import cv2
 from PyQt5.QtWidgets import QApplication
 
@@ -8,6 +10,15 @@ from inference.gesture_worker import GestureWorker
 from ui.draw_utils import draw_text_box_bgr
 
 from .base_page import BasePage
+
+# 推理节流：与 face14_page 相同的闸门参数，限制向推理 worker 提交帧的频率。
+INFERENCE_FPS_LIMIT = 10.0
+# 容差系数：闸门间隔取目标间隔的 85%。帧到达时刻是离散的（33.3ms 一格），
+# 若阈值卡得刚好，抖动会让每隔一次都差几毫秒不达标，实际频率直接腰斩
+# （实测 10Hz 设定跑出 5.2Hz）。留 15% 容差可吸收抖动。
+_SUBMIT_TOLERANCE = 0.85
+_MIN_SUBMIT_INTERVAL_NS = (int(1e9 / INFERENCE_FPS_LIMIT * _SUBMIT_TOLERANCE)
+                           if INFERENCE_FPS_LIMIT > 0 else 0)
 
 
 class GesturePage(BasePage):
@@ -27,25 +38,57 @@ class GesturePage(BasePage):
         self._pending_gesture = None
         self._pending_count = 0
         self._stable_gesture = ""
+        self._last_submit_ns = 0
+        self._submit_skipped = 0
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._shutdown_worker)
 
-    def process_frame(self, bgr_frame, depth_frame=None):
-        if self._worker is not None:
+    def _should_submit(self):
+        """推理节流闸门：距上次提交不足最小间隔时跳过，不占用推理算力。
+
+        以"提交时刻"而非"结果返回时刻"为基准，且带 15% 容差，避免与
+        离散的帧到达时刻发生拍频。
+        """
+        if _MIN_SUBMIT_INTERVAL_NS <= 0:
+            return True
+        now_ns = time.perf_counter_ns()
+        if now_ns - self._last_submit_ns < _MIN_SUBMIT_INTERVAL_NS:
+            self._submit_skipped += 1
+            return False
+        self._last_submit_ns = now_ns
+        return True
+
+    def process_frame(self, bgr_frame, bgr_display=None, depth_frame=None):
+        if self._worker is not None and self._should_submit():
+            # 推理永远送原始 1280x720 帧，显示放大不参与推理链路。
             self._worker.submit_frame(bgr_frame, depth_frame)
-        # P0 UI 渲染性能优化：绘制前先降采样，坐标同步缩放。
-        height, width = bgr_frame.shape[:2]
-        target_width, target_height, scale = self.compute_target_size(
-            width, height)
-        small_frame = cv2.resize(
-            bgr_frame, (target_width, target_height),
-            interpolation=cv2.INTER_LINEAR)
+        # 绘制底图用采集线程预放大的显示帧；为 None 时回退原始帧。
+        display_frame = (bgr_display if bgr_display is not None
+                         else bgr_frame)
+        # 两级缩放：display_scale（原始帧 -> 显示帧，宽高独立）与
+        # target_scale（显示帧 -> 画布，等比，仅画布小于显示帧时才 <1）。
+        scale_x, scale_y = self.compute_display_scale(
+            bgr_frame.shape, display_frame.shape)
+        display_height, display_width = display_frame.shape[:2]
+        target_width, target_height, target_scale = self.compute_target_size(
+            display_width, display_height)
+        if target_scale >= 1.0:
+            # 画布不小于显示帧：跳过 cv2.resize，直接用显示帧。
+            # 修复原有 bug：此前无条件 resize 会在 scale=1.0 时对每帧做
+            # 一次同尺寸全帧拷贝。
+            small_frame = display_frame
+        else:
+            small_frame = cv2.resize(
+                display_frame, (target_width, target_height),
+                interpolation=cv2.INTER_LINEAR)
         if self._latest_lm is None or not self._stable_gesture:
             return small_frame, self._status_text
         lm_scaled = self._latest_lm.copy()
-        lm_scaled[:, 0] *= scale
-        lm_scaled[:, 1] *= scale
+        # lm 为 Nx2 数组：x 列乘 scale_x，y 列乘 scale_y，再统一乘
+        # target_scale。
+        lm_scaled[:, 0] *= scale_x * target_scale
+        lm_scaled[:, 1] *= scale_y * target_scale
         rendered = draw(small_frame.copy(), lm_scaled, self._stable_gesture)
         if (self._latest_distance_cm is not None
                 and self._latest_distance_cm > 0.0):
@@ -57,6 +100,7 @@ class GesturePage(BasePage):
 
     def on_activated(self):
         self._active = True
+        self._last_submit_ns = 0
         if self._worker is None:
             self._start_worker()
         elif self._stop_requested:

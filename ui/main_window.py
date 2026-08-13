@@ -48,6 +48,9 @@ class MainWindow(QMainWindow):
         # 最新帧槽位：采集线程只写，主线程只读，写入为原子引用赋值。
         # 取代原 InferenceThread 直通层的"容量1队列丢旧帧"语义。
         self._latest_bgr = None
+        # 显示帧槽位：采集线程预放大的 1644x924 帧，只用于绘制底图；
+        # 推理 worker 引用的始终是 _latest_bgr 原始帧。
+        self._latest_bgr_display = None
         self._latest_depth = None
         self._latest_stamp_ns = None
         self._rendered_stamp_ns = None
@@ -163,8 +166,8 @@ class MainWindow(QMainWindow):
             button.setChecked(i == index)
         self._update_header(index)
 
-    @pyqtSlot(object, object)
-    def _on_capture_frame(self, bgr_frame, depth_frame):
+    @pyqtSlot(object, object, object)
+    def _on_capture_frame(self, bgr_frame, bgr_display, depth_frame):
         """采集线程回调：只更新最新帧槽位，不做任何绘制。
 
         若上一帧尚未被渲染就被覆盖，等同于原 InferenceThread 的主动跳帧。
@@ -173,6 +176,7 @@ class MainWindow(QMainWindow):
             self._dropped_frames += 1
             PERF.increment("pipeline_queue_dropped")
         self._latest_bgr = bgr_frame
+        self._latest_bgr_display = bgr_display
         self._latest_depth = depth_frame
         self._latest_stamp_ns = time.perf_counter_ns()
 
@@ -182,6 +186,8 @@ class MainWindow(QMainWindow):
         if stamp_ns is None or stamp_ns == self._rendered_stamp_ns:
             return
         bgr_frame = self._latest_bgr
+        # 显示帧：采集线程预放大的帧，仅用于绘制；推理仍走 bgr_frame。
+        bgr_display = self._latest_bgr_display
         depth_frame = self._latest_depth
         self._rendered_stamp_ns = stamp_ns
         if bgr_frame is None:
@@ -197,7 +203,8 @@ class MainWindow(QMainWindow):
                    "采集到渲染的等待时间")
         page = self.pages[self.stack.currentIndex()]
         page._perf_frame_received_ns = received_ns
-        rendered, result = page.process_frame(bgr_frame, depth_frame)
+        rendered, result = page.process_frame(bgr_frame, bgr_display,
+                                              depth_frame)
         page.show_frame(rendered)
         self.status_label.setText(result or "摄像头已连接")
         finished_ns = time.perf_counter_ns()

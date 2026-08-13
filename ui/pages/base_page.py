@@ -61,8 +61,31 @@ class BasePage(QWidget):
         layout.setContentsMargins(24, 20, 24, 20)
         layout.addWidget(panel, 1)
 
-    def process_frame(self, bgr_frame, depth_frame=None) -> Tuple[object, str]:
+    def process_frame(self, bgr_frame, bgr_display=None, depth_frame=None) -> Tuple[object, str]:
+        """统一帧处理接口。
+
+        bgr_frame：原始帧（1280x720），推理链路永远用它。
+        bgr_display：采集线程预放大的显示帧（1644x924），只用于绘制底图；
+        为 None 时页面回退使用 bgr_frame（行为与改造前一致）。
+        depth_frame：深度帧，按页需求使用。
+        """
         return bgr_frame, ""
+
+    def compute_display_scale(self, source_shape, display_shape):
+        """返回 (scale_x, scale_y)。宽高独立计算，避免 0.08% 比例偏差累积。
+
+        display_shape 为 None 或与 source 相同时返回 (1.0, 1.0)。
+        worker 返回的坐标位于 source（原始帧）坐标系，绘制到显示帧上时
+        按此系数换算：x 乘 scale_x，y 乘 scale_y。
+        """
+        if display_shape is None:
+            return 1.0, 1.0
+        source_height, source_width = source_shape[:2]
+        display_height, display_width = display_shape[:2]
+        if (source_width, source_height) == (display_width, display_height):
+            return 1.0, 1.0
+        return (display_width / float(source_width),
+                display_height / float(source_height))
 
     def on_activated(self):
         pass
@@ -75,10 +98,10 @@ class BasePage(QWidget):
         """按视频画布等比计算目标尺寸，并返回宽度缩放比例。
 
         重要：只缩小，绝不放大。
-        实测 video_label 为 1642x952，比 1280x720 的源帧更大；若按画布尺寸
-        resize 会把像素量抬高 65%，绘制成本不降反升。画布大于源帧时一律返回
-        原始尺寸与 scale=1.0，放大交由 QPixmap.scaled(FastTransformation)
-        完成（实测 0.0~0.1ms，可忽略）。
+        显示帧已由采集线程预放大到 1644x924，接近 video_label 1644x960；
+        只有画布小于显示帧（如窗口被缩小）时才降采样，画布更大时返回
+        原始尺寸与 scale=1.0。放大的昂贵路径（主线程 QPixmap.scaled
+        实测 9.7ms/帧）已在采集线程解决，此处绝不执行放大。
         """
         source_width = int(source_width)
         source_height = int(source_height)
@@ -133,8 +156,12 @@ class BasePage(QWidget):
         self._refresh_pixmap(False)
 
     def _refresh_pixmap(self, count_frame=True):
-        """P0 优化：不再做 QPixmap.scaled（实测 9.7ms/帧），
-        改由 video_label.setScaledContents(True) 在 paint 阶段直接拉伸。"""
+        """P0 优化：不再做 QPixmap.scaled（实测 9.7ms/帧）。
+
+        显示帧已由采集线程预放大到 1644x924，与 video_label 1644x960 几乎
+        一致，直接 setPixmap 即可；保持 setScaledContents(False) 零缩放，
+        paint 阶段无任何拉伸开销。
+        """
         if self._last_pixmap is None:
             return
         set_started_ns = time.perf_counter_ns()

@@ -78,39 +78,57 @@ class Face14Page(BasePage):
         self._last_submit_ns = now_ns
         return True
 
-    def process_frame(self, bgr_frame, depth_frame=None):
+    def process_frame(self, bgr_frame, bgr_display=None, depth_frame=None):
         if self._worker is not None and self._should_submit():
+            # 推理永远送原始 1280x720 帧：yunet_get_facebox 首行即 resize 到
+            # 640x640，输入变大会抬高前处理成本；且距离换算按传入帧 shape
+            # 计算，彩色帧尺寸变了而深度帧没变会导致距离错位。
             self._worker.submit_frame(bgr_frame, depth_frame)
-        # P0 UI 渲染性能优化：只在画布小于源帧时才降采样；scale==1.0 时
-        # 完全跳过 cv2.resize，直接用原帧绘制，放大交给 Qt。
-        height, width = bgr_frame.shape[:2]
-        target_width, target_height, scale = self.compute_target_size(
-            width, height)
-        if scale >= 1.0:
-            small_frame = bgr_frame
+        # 绘制底图用采集线程预放大的显示帧；为 None 时回退原始帧
+        #（行为与改造前一致）。
+        display_frame = (bgr_display if bgr_display is not None
+                         else bgr_frame)
+        # 两级缩放：display_scale（原始帧 -> 显示帧，宽高独立）与
+        # target_scale（显示帧 -> 画布，等比，仅画布小于显示帧时才 <1）。
+        scale_x, scale_y = self.compute_display_scale(
+            bgr_frame.shape, display_frame.shape)
+        display_height, display_width = display_frame.shape[:2]
+        target_width, target_height, target_scale = self.compute_target_size(
+            display_width, display_height)
+        if target_scale >= 1.0:
+            # 画布不小于显示帧：跳过 cv2.resize 直接用显示帧。
+            small_frame = display_frame
         else:
             small_frame = cv2.resize(
-                bgr_frame, (target_width, target_height),
+                display_frame, (target_width, target_height),
                 interpolation=cv2.INTER_LINEAR)
         try:
             display_face14 = (self._update_display_face14()
                               if self._latest_face14 is not None else None)
             face14_scaled = None
             if display_face14 is not None:
-                if scale >= 1.0:
+                if scale_x == 1.0 and scale_y == 1.0 and target_scale >= 1.0:
+                    # 无任何缩放时直接复用，保持原性能路径。
                     face14_scaled = display_face14
                 else:
                     face14_scaled = {
-                        name: (point[0] * scale, point[1] * scale)
+                        name: (point[0] * scale_x * target_scale,
+                               point[1] * scale_y * target_scale)
                         for name, point in display_face14.items()
                     }
             face_box_scaled = None
             if self._latest_face_box is not None:
-                if scale >= 1.0:
+                if scale_x == 1.0 and scale_y == 1.0 and target_scale >= 1.0:
                     face_box_scaled = self._latest_face_box
                 else:
-                    face_box_scaled = [value * scale
-                                       for value in self._latest_face_box]
+                    # box 为 [x1, y1, x2, y2]：x 项乘 scale_x，y 项乘
+                    # scale_y，再统一乘 target_scale。
+                    face_box_scaled = [
+                        self._latest_face_box[0] * scale_x * target_scale,
+                        self._latest_face_box[1] * scale_y * target_scale,
+                        self._latest_face_box[2] * scale_x * target_scale,
+                        self._latest_face_box[3] * scale_y * target_scale,
+                    ]
             draw_started_ns = time.perf_counter_ns()
             rendered = draw_face14_fast(small_frame, face14_scaled,
                                         face_box_scaled, self._latest_score)
