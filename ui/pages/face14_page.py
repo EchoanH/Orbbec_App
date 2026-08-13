@@ -7,20 +7,30 @@ import time
 import cv2
 from PyQt5.QtWidgets import QApplication
 
-from inference.face14_infer import draw_face14
 from inference.face14_worker import Face14Worker
+from perf_logging import get_perf_logger
 from ui.draw_utils import draw_text_box_bgr
+from ui.fast_draw import draw_face14_fast
 
 from .base_page import BasePage
 
 
 LOGGER = logging.getLogger(__name__)
+PERF = get_perf_logger()
 
 # 现场对比开关：False 时直接绘制 worker 输出的原始坐标。
 SMOOTHING_ENABLED = True
 SMOOTHING_TAU_MS = 30.0
 # 任一点位移超过新结果 14 点包围框最大边长的 20% 时整组直接吸附。
 SMOOTHING_SNAP_RATIO = 0.20
+
+INFERENCE_FPS_LIMIT = 10.0
+# 容差系数：闸门间隔取目标间隔的 85%。帧到达时刻是离散的（33.3ms 一格），
+# 若阈值卡得刚好，抖动会让每隔一次都差几毫秒不达标，实际频率直接腰斩
+# （实测 10Hz 设定跑出 5.2Hz）。留 15% 容差可吸收抖动。
+_SUBMIT_TOLERANCE = 0.85
+_MIN_SUBMIT_INTERVAL_NS = (int(1e9 / INFERENCE_FPS_LIMIT * _SUBMIT_TOLERANCE)
+                           if INFERENCE_FPS_LIMIT > 0 else 0)
 
 
 class Face14Page(BasePage):
@@ -43,6 +53,8 @@ class Face14Page(BasePage):
         self._worker_failed = False
         self._worker_stop_requested = False
         self._restart_when_finished = False
+        self._last_submit_ns = 0
+        self._submit_skipped = 0
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._shutdown_worker)
@@ -51,31 +63,59 @@ class Face14Page(BasePage):
         super(Face14Page, self).showEvent(event)
         self.on_activated()
 
+    def _should_submit(self):
+        """推理节流闸门：距上次提交不足最小间隔时跳过，不占用推理算力。
+
+        以"提交时刻"而非"结果返回时刻"为基准，且带 15% 容差，避免与
+        离散的帧到达时刻发生拍频。
+        """
+        if _MIN_SUBMIT_INTERVAL_NS <= 0:
+            return True
+        now_ns = time.perf_counter_ns()
+        if now_ns - self._last_submit_ns < _MIN_SUBMIT_INTERVAL_NS:
+            self._submit_skipped += 1
+            return False
+        self._last_submit_ns = now_ns
+        return True
+
     def process_frame(self, bgr_frame, depth_frame=None):
-        if self._worker is not None:
+        if self._worker is not None and self._should_submit():
             self._worker.submit_frame(bgr_frame, depth_frame)
-        # P0 UI 渲染性能优化：绘制前先降采样，坐标同步缩放。
+        # P0 UI 渲染性能优化：只在画布小于源帧时才降采样；scale==1.0 时
+        # 完全跳过 cv2.resize，直接用原帧绘制，放大交给 Qt。
         height, width = bgr_frame.shape[:2]
         target_width, target_height, scale = self.compute_target_size(
             width, height)
-        small_frame = cv2.resize(
-            bgr_frame, (target_width, target_height),
-            interpolation=cv2.INTER_LINEAR)
+        if scale >= 1.0:
+            small_frame = bgr_frame
+        else:
+            small_frame = cv2.resize(
+                bgr_frame, (target_width, target_height),
+                interpolation=cv2.INTER_LINEAR)
         try:
             display_face14 = (self._update_display_face14()
                               if self._latest_face14 is not None else None)
             face14_scaled = None
             if display_face14 is not None:
-                face14_scaled = {
-                    name: (point[0] * scale, point[1] * scale)
-                    for name, point in display_face14.items()
-                }
+                if scale >= 1.0:
+                    face14_scaled = display_face14
+                else:
+                    face14_scaled = {
+                        name: (point[0] * scale, point[1] * scale)
+                        for name, point in display_face14.items()
+                    }
             face_box_scaled = None
             if self._latest_face_box is not None:
-                face_box_scaled = [value * scale
-                                   for value in self._latest_face_box]
-            rendered = draw_face14(small_frame, face14_scaled,
-                                   face_box_scaled, self._latest_score)
+                if scale >= 1.0:
+                    face_box_scaled = self._latest_face_box
+                else:
+                    face_box_scaled = [value * scale
+                                       for value in self._latest_face_box]
+            draw_started_ns = time.perf_counter_ns()
+            rendered = draw_face14_fast(small_frame, face14_scaled,
+                                        face_box_scaled, self._latest_score)
+            PERF.event("诊断process_frame绘制耗时",
+                       (time.perf_counter_ns() - draw_started_ns) / 1e6)
             if (self._latest_distance_cm is not None
                     and self._latest_distance_cm > 0.0
                     and face_box_scaled is not None):
@@ -94,7 +134,10 @@ class Face14Page(BasePage):
             return small_frame, message
 
     def on_activated(self):
+        LOGGER.warning("on_activated 被调用，当前 self._worker=%s, tid=%s",
+                       self._worker, id(self))
         self._active = True
+        self._last_submit_ns = 0
         if self._worker is None:
             self._start_worker()
         elif self._worker_stop_requested:
@@ -132,7 +175,16 @@ class Face14Page(BasePage):
         self._status_text = text
 
     def _on_result(self, face14, face_box, score, distance_cm, elapsed_ms,
-                   text):
+                   text, emit_wall_time=None):
+        # 诊断埋点：信号被主线程真正处理的时刻，减去 worker 发出信号的时刻，
+        # 得到跨线程排队延迟。两端都用 time.time()（墙钟），量级一致可直接
+        # 相减；不要混用 perf_counter_ns()（起点不确定）与 time.time()。
+        if emit_wall_time is not None:
+            queue_delay_ms = (time.time() - emit_wall_time) * 1000.0
+            PERF.event("诊断信号跨线程延迟", queue_delay_ms)
+            if queue_delay_ms > 100.0:
+                PERF.event("诊断信号跨线程延迟异常", queue_delay_ms,
+                           "超过100ms", level="WARNING")
         if not self._active or self._worker_stop_requested:
             return
         self._latest_face14 = face14

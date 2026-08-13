@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from queue import Empty, Full, Queue
 
+#VERBOSE = False
 
 class _PerfStats(object):
     """跨线程共享的轻量计数器与仪表值。"""

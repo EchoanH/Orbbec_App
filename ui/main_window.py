@@ -4,14 +4,13 @@ import logging
 import time
 from typing import List, Tuple
 
-from PyQt5.QtCore import Qt, pyqtSlot
+from PyQt5.QtCore import Qt, QTimer, pyqtSlot
 from PyQt5.QtGui import QKeyEvent
 from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMainWindow,
                              QPushButton, QStackedWidget, QVBoxLayout,
                              QWidget)
 
 from camera.capture_thread import CaptureThread
-from camera.inference_thread import InferenceThread
 from camera.orbbec_source import OrbbecSource
 from perf_logging import get_perf_logger
 from ui.pages.enroll_page import EnrollPage
@@ -22,6 +21,10 @@ from ui.pages.pedestrian_page import PedestrianPage
 
 LOGGER = logging.getLogger(__name__)
 PERF = get_perf_logger()
+
+# 渲染节拍：主线程按此间隔取最新帧渲染。33ms 约 30fps 上限；
+# 主线程若来不及，下一拍自然跳过中间帧，不会在 Qt 事件队列里堆积。
+RENDER_INTERVAL_MS = 33
 
 
 class MainWindow(QMainWindow):
@@ -40,19 +43,27 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.source = OrbbecSource()
         self.capture_thread = CaptureThread(self.source, self)
-        self.inference_thread = InferenceThread(self)
         self._perf_last_ui_frame_ns = None
+        # 最新帧槽位：采集线程只写，主线程只读，写入为原子引用赋值。
+        # 取代原 InferenceThread 直通层的"容量1队列丢旧帧"语义。
+        self._latest_bgr = None
+        self._latest_depth = None
+        self._latest_stamp_ns = None
+        self._rendered_stamp_ns = None
+        self._dropped_frames = 0
         self.yunet_session = yunet_session
         self.pages = [Face14Page(self.yunet_session), PedestrianPage(),
                       GesturePage(), EnrollPage(self.yunet_session)]
         self.nav_buttons = []
         self._build_ui()
-        self.capture_thread.frame_ready.connect(self.inference_thread.submit_frame)
-        self.inference_thread.frame_ready.connect(self._on_frame)
+        self.capture_thread.frame_ready.connect(self._on_capture_frame)
         self.capture_thread.status_changed.connect(self._on_status)
         self.capture_thread.error_occurred.connect(self._on_error)
         self.capture_thread.fps_changed.connect(self._on_fps)
-        self.inference_thread.start()
+        self.render_timer = QTimer(self)
+        self.render_timer.setTimerType(Qt.PreciseTimer)
+        self.render_timer.timeout.connect(self._render_latest)
+        self.render_timer.start(RENDER_INTERVAL_MS)
         self.capture_thread.start()
 
     def _build_ui(self):
@@ -152,7 +163,28 @@ class MainWindow(QMainWindow):
         self._update_header(index)
 
     @pyqtSlot(object, object)
-    def _on_frame(self, bgr_frame, depth_frame):
+    def _on_capture_frame(self, bgr_frame, depth_frame):
+        """采集线程回调：只更新最新帧槽位，不做任何绘制。
+
+        若上一帧尚未被渲染就被覆盖，等同于原 InferenceThread 的主动跳帧。
+        """
+        if self._latest_stamp_ns is not None and self._rendered_stamp_ns != self._latest_stamp_ns:
+            self._dropped_frames += 1
+            PERF.increment("pipeline_queue_dropped")
+        self._latest_bgr = bgr_frame
+        self._latest_depth = depth_frame
+        self._latest_stamp_ns = time.perf_counter_ns()
+
+    def _render_latest(self):
+        """渲染节拍：取最新帧交给当前页处理与显示。"""
+        stamp_ns = self._latest_stamp_ns
+        if stamp_ns is None or stamp_ns == self._rendered_stamp_ns:
+            return
+        bgr_frame = self._latest_bgr
+        depth_frame = self._latest_depth
+        self._rendered_stamp_ns = stamp_ns
+        if bgr_frame is None:
+            return
         received_ns = time.perf_counter_ns()
         if self._perf_last_ui_frame_ns is not None:
             interval_ms = (received_ns - self._perf_last_ui_frame_ns) / 1e6
@@ -160,7 +192,8 @@ class MainWindow(QMainWindow):
                 PERF.event("UI线程阻塞", interval_ms,
                            "帧间隔超过50ms", level="WARNING")
         self._perf_last_ui_frame_ns = received_ns
-        PERF.event("UI收到新帧", 0.0)
+        PERF.event("UI收到新帧", (received_ns - stamp_ns) / 1e6,
+                   "采集到渲染的等待时间")
         page = self.pages[self.stack.currentIndex()]
         page._perf_frame_received_ns = received_ns
         rendered, result = page.process_frame(bgr_frame, depth_frame)
@@ -195,10 +228,9 @@ class MainWindow(QMainWindow):
         super(MainWindow, self).keyPressEvent(event)
 
     def closeEvent(self, event):
+        if self.render_timer.isActive():
+            self.render_timer.stop()
         if self.capture_thread.isRunning():
             self.capture_thread.stop()
             self.capture_thread.wait()
-        if self.inference_thread.isRunning():
-            self.inference_thread.stop()
-            self.inference_thread.wait()
         event.accept()

@@ -19,7 +19,13 @@ class Face14Worker(QThread):
     """容量为 1 的跳帧 worker，采集和 GUI 不等待推理完成。"""
 
     status_ready = pyqtSignal(str)
-    result_ready = pyqtSignal(object, object, float, object, float, str)
+    # 诊断埋点：末尾新增 emit_wall_time（信号发出时的 time.time() 秒级浮点），
+    # 用于测量 worker 发出信号到主线程真正处理信号之间的跨线程排队延迟。
+    # 注意：不能用 perf_counter_ns() 传给 Qt 的 int 类型信号参数，纳秒级
+    # 大整数会超出 Qt/SIP 的 int 范围导致截断（本次踩坑教训）。改用
+    # time.time() 的秒级浮点数，量级小、Qt float 类型可以完整传递。
+    # 不影响任何推理/绘制逻辑，仅用于排查偶发的孤立卡顿。
+    result_ready = pyqtSignal(object, object, float, object, float, str, float)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, yunet_session, parent=None):
@@ -116,14 +122,21 @@ class Face14Worker(QThread):
                     PERF.event("Face14单帧总耗时", total_ms,
                                "从队列取出到结果准备完成")
                     self._last_error = None
+                    emit_wall_time = time.time()
                     if face14 is None:
                         text = "未检测到人脸 · %s" % update_rate_text
+                        PERF.event("诊断信号发出", 0.0,
+                                   "result_ready.emit face14=None")
                         self.result_ready.emit(None, None, 0.0, None,
-                                                elapsed_ms, text)
+                                                elapsed_ms, text,
+                                                emit_wall_time)
                     else:
                         text = "已检测 · 置信度 %.3f · %s" % (score, update_rate_text)
+                        PERF.event("诊断信号发出", 0.0,
+                                   "result_ready.emit face14=检出")
                         self.result_ready.emit(face14, face_box, score,
-                                                distance_cm, elapsed_ms, text)
+                                                distance_cm, elapsed_ms, text,
+                                                emit_wall_time)
                 except Exception as exc:
                     total_ms = (time.perf_counter_ns() - frame_started_ns) / 1e6
                     PERF.event("Face14单帧总耗时", total_ms,
