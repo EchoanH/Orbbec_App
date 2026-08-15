@@ -15,6 +15,8 @@ from .depth_utils import color_to_depth_point, get_distance
 PALM_OM = "/root/echo/atc_work/palm_192_nr.om"
 HAND_OM = "/root/echo/atc_work/handpose_224.om"
 REF_PY = "/root/echo/ref/palm_detection_mp_palmdet.py"
+DEBUG_GESTURE = os.environ.get("DEBUG_GESTURE", "0") == "1"
+DEBUG_GESTURE_DIR = "debug_gesture"
 
 PALM_INPUT = 192
 HAND_INPUT = np.array([224, 224])
@@ -34,6 +36,23 @@ FINGERS = [[0, 1, 2, 3, 4], [0, 5, 6, 7, 8],
 TIP = {"index": 8, "middle": 12, "ring": 16, "pinky": 20}
 PIP = {"index": 6, "middle": 10, "ring": 14, "pinky": 18}
 FIVE_TIPS = [4, 8, 12, 16, 20]
+
+
+def _save_debug_image(name, bgr):
+    os.makedirs(DEBUG_GESTURE_DIR, exist_ok=True)
+    cv2.imwrite(os.path.join(DEBUG_GESTURE_DIR, name), bgr)
+
+
+def _save_palm_debug(image, palm):
+    vis = image.copy()
+    bbox = palm[0:4].reshape(2,2).astype(np.int32)
+    landmarks = palm[4:18].reshape(7,2).astype(np.int32)
+    cv2.rectangle(vis, tuple(bbox[0]), tuple(bbox[1]), (0,255,0), 2)
+    for i, point in enumerate(landmarks):
+        cv2.circle(vis, tuple(point), 4, (0,0,255), -1)
+        cv2.putText(vis, str(i), (point[0]+5, point[1]-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+    _save_debug_image("01_palm_bbox.jpg", vis)
 
 
 def ground_truth(tag):
@@ -143,13 +162,21 @@ def preprocess(image, palm):
     c = np.sum(pb, axis=0)/2
     rm = cv2.getRotationMatrix2D((float(c[0]), float(c[1])), ang, 1.0)
     rot = cv2.warpAffine(img, rm, (img.shape[1], img.shape[0]))
+    if DEBUG_GESTURE:
+        _save_debug_image("02_rotate.jpg", cv2.cvtColor(rot, cv2.COLOR_RGB2BGR))
     homo = np.c_[plm, np.ones(plm.shape[0])]
     rlm = np.array([np.dot(homo, rm[0]), np.dot(homo, rm[1])])
     rb = np.array([np.amin(rlm, axis=1), np.amax(rlm, axis=1)])
     crop, rb, _ = crop_and_pad(rot, rb)
     if crop is None or crop.size == 0: return None
+    if DEBUG_GESTURE:
+        _save_debug_image("03_final_crop.jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
     blob = cv2.resize(crop, dsize=tuple(HAND_INPUT),
                       interpolation=cv2.INTER_AREA).astype(np.float32)/255.0
+    if DEBUG_GESTURE:
+        handpose_input = np.clip(blob*255.0, 0, 255).astype(np.uint8)
+        _save_debug_image("04_handpose_input.jpg",
+                          cv2.cvtColor(handpose_input, cv2.COLOR_RGB2BGR))
     return np.ascontiguousarray(blob[np.newaxis,:,:,:]), rb, ang, rm, pad_bias
 
 
@@ -232,6 +259,8 @@ class GestureEngine(object):
         palms, palm_score = palm_detect(self.palm_session, self.anchors, bgr)
         if not palms:
             return None, None, 0.0, None, "palm 未检出（最高 %.3f）" % palm_score
+        if DEBUG_GESTURE:
+            _save_palm_debug(bgr, palms[0][0])
         pre = preprocess(bgr, palms[0][0])
         if pre is None:
             return None, None, 0.0, None, "手部裁剪失败"
