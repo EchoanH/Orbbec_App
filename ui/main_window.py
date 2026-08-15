@@ -18,6 +18,7 @@ from ui.pages.enroll_page import EnrollPage
 from ui.pages.face14_page import Face14Page
 from ui.pages.gesture_page import GesturePage
 from ui.pages.pedestrian_page import PedestrianPage
+from ui.pages.target_tracking_page import TargetTrackingPage
 
 
 LOGGER = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ class MainWindow(QMainWindow):
         ("手势识别", "gesture"),
         ("人脸录入", "enroll"),
         ("深度识别", "depth"),
+        ("动态目标跟踪", "target_tracking"),
     ]
 
     def __init__(self, yunet_session):
@@ -60,7 +62,7 @@ class MainWindow(QMainWindow):
         self.yunet_session = yunet_session
         self.pages = [Face14Page(self.yunet_session), PedestrianPage(),
                       GesturePage(), EnrollPage(self.yunet_session),
-                      DepthPage()]
+                      DepthPage(), TargetTrackingPage()]
         self.nav_buttons = []
         self._build_ui()
         self.capture_thread.frame_ready.connect(self._on_capture_frame)
