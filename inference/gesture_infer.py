@@ -19,6 +19,7 @@ DEBUG_GESTURE = os.environ.get("DEBUG_GESTURE", "0") == "1"
 DEBUG_GESTURE_DIR = "debug_gesture"
 
 PALM_INPUT = 192
+PALM_CENTER_ROI_RATIO = 0.70
 HAND_INPUT = np.array([224, 224])
 SCORE_TH = 0.35
 NMS_TH = 0.30
@@ -109,7 +110,7 @@ def palm_candidate_score(box, score, image_shape):
     return float(score)*0.6 + area_ratio*0.2 + center_score*0.2
 
 
-def palm_detect(sess, anchors, bgr):
+def _palm_detect_once(sess, anchors, bgr, save_input=False):
     h, w = bgr.shape[:2]
     ratio = min(PALM_INPUT/float(h), PALM_INPUT/float(w))
     nh, nw = int(h*ratio), int(w*ratio)
@@ -120,7 +121,7 @@ def palm_detect(sess, anchors, bgr):
                             cv2.BORDER_CONSTANT, None, (0,0,0))
     im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
     blob = np.ascontiguousarray(im[np.newaxis,:,:,:])
-    if DEBUG_GESTURE:
+    if save_input and DEBUG_GESTURE:
         palm_input = np.clip(blob[0]*255.0, 0, 255).astype(np.uint8)
         _save_debug_image("palm_input.jpg",
                           cv2.cvtColor(palm_input, cv2.COLOR_RGB2BGR))
@@ -135,6 +136,25 @@ def palm_detect(sess, anchors, bgr):
     boxes = np.concatenate([xy1, xy2], 1) - np.array(
         [pad_bias[0], pad_bias[1], pad_bias[0], pad_bias[1]], np.float32)
     lms = (o0[0,:,4:].reshape(-1,7,2)/PALM_INPUT + anchors[:,None,:])*scale - pad_bias
+    return boxes, lms, score
+
+
+def palm_detect(sess, anchors, bgr):
+    h, w = bgr.shape[:2]
+    boxes, lms, score = _palm_detect_once(sess, anchors, bgr, True)
+
+    roi_h = max(1, int(h*PALM_CENTER_ROI_RATIO))
+    roi_w = max(1, int(w*PALM_CENTER_ROI_RATIO))
+    roi_y = (h-roi_h)//2
+    roi_x = (w-roi_w)//2
+    roi = bgr[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+    roi_boxes, roi_lms, roi_score = _palm_detect_once(sess, anchors, roi)
+    roi_boxes += np.array([roi_x, roi_y, roi_x, roi_y], np.float32)
+    roi_lms += np.array([roi_x, roi_y], np.float32)
+
+    boxes = np.concatenate([boxes, roi_boxes], axis=0)
+    lms = np.concatenate([lms, roi_lms], axis=0)
+    score = np.concatenate([score, roi_score], axis=0)
     m = score > SCORE_TH
     if m.sum() == 0: return [], float(score.max())
     idx = np.where(m)[0]
