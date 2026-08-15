@@ -22,10 +22,12 @@ PALM_INPUT = 192
 PALM_CENTER_ROI_RATIO = 0.70
 HAND_INPUT = np.array([224, 224])
 SCORE_TH = 0.35
+PALM_FALLBACK_SCORE_TH = 0.15
+PALM_FALLBACK_MAX_ALTERNATIVES = 5
 NMS_TH = 0.30
 HAND_CONF_TH = 0.50
 THUMB_OPEN_TH = 0.85
-EXT_TH = 0.0
+PIP_ANGLE_TH = 150.0
 
 PALM_BOX_PRE_SHIFT_VECTOR = np.array([0, 0], np.float32)
 PALM_BOX_PRE_ENLARGE_FACTOR = 4
@@ -35,8 +37,12 @@ PALM_BOX_ENLARGE_FACTOR = 3
 FINGERS = [[0, 1, 2, 3, 4], [0, 5, 6, 7, 8],
            [0, 9, 10, 11, 12], [0, 13, 14, 15, 16],
            [0, 17, 18, 19, 20]]
-TIP = {"index": 8, "middle": 12, "ring": 16, "pinky": 20}
-PIP = {"index": 6, "middle": 10, "ring": 14, "pinky": 18}
+PIP_ANGLE_POINTS = {
+    "index": (5, 6, 7),
+    "middle": (9, 10, 11),
+    "ring": (13, 14, 15),
+    "pinky": (17, 18, 19),
+}
 FIVE_TIPS = [4, 8, 12, 16, 20]
 
 
@@ -139,7 +145,7 @@ def _palm_detect_once(sess, anchors, bgr, save_input=False):
     return boxes, lms, score
 
 
-def palm_detect(sess, anchors, bgr):
+def _collect_palm_candidates(sess, anchors, bgr, score_th):
     h, w = bgr.shape[:2]
     boxes, lms, score = _palm_detect_once(sess, anchors, bgr, True)
 
@@ -155,7 +161,7 @@ def palm_detect(sess, anchors, bgr):
     boxes = np.concatenate([boxes, roi_boxes], axis=0)
     lms = np.concatenate([lms, roi_lms], axis=0)
     score = np.concatenate([score, roi_score], axis=0)
-    m = score > SCORE_TH
+    m = score > score_th
     if m.sum() == 0: return [], float(score.max())
     idx = np.where(m)[0]
     print("score candidates:", len(idx))
@@ -177,7 +183,13 @@ def palm_detect(sess, anchors, bgr):
         print("idx=%d score=%.3f final=%.3f box=%s" % (
             i, score[i], final_scores[int(i)], boxes[i]))
     return ([(np.concatenate([boxes[i], lms[i].reshape(-1)]).astype(np.float32),
-              float(score[i])) for i in sel], float(score.max()))
+              float(score[i]), int(i)) for i in sel], float(score.max()))
+
+
+def palm_detect(sess, anchors, bgr):
+    candidates, max_score = _collect_palm_candidates(
+        sess, anchors, bgr, SCORE_TH)
+    return [(palm, score) for palm, score, _ in candidates], max_score
 
 
 def crop_and_pad(image, palm_bbox, for_rotation=False):
@@ -254,17 +266,29 @@ def postprocess(outs, rb, ang, rm, pad_bias):
     return lm, conf, handed
 
 
+def safe_angle_2d(a, b, c):
+    ba = np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)
+    bc = np.asarray(c, dtype=np.float32) - np.asarray(b, dtype=np.float32)
+    denom = float(np.linalg.norm(ba)*np.linalg.norm(bc))
+    if denom <= 1e-6:
+        return 0.0
+    cosine = float(np.dot(ba, bc))/denom
+    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+
+
 def classify(lm):
     p = lm[:,:2]
     base = np.linalg.norm(p[0]-p[9]) + 1e-6
     def d(a,b): return np.linalg.norm(p[a]-p[b])/base
-    ext = {f: (d(TIP[f],0)-d(PIP[f],0)) > EXT_TH for f in TIP}
+    angles = {f: safe_angle_2d(p[a], p[b], p[c])
+              for f, (a, b, c) in PIP_ANGLE_POINTS.items()}
+    ext = {f: angle >= PIP_ANGLE_TH for f, angle in angles.items()}
     d49 = d(4,9)
     thumb_open = d49 > THUMB_OPEN_TH
     n = sum(ext.values())
-    detail = "食%+.2f 中%+.2f 无名%+.2f 小%+.2f d49=%.2f" % (
-        d(TIP["index"],0)-d(PIP["index"],0), d(TIP["middle"],0)-d(PIP["middle"],0),
-        d(TIP["ring"],0)-d(PIP["ring"],0), d(TIP["pinky"],0)-d(PIP["pinky"],0), d49)
+    detail = "食%.1f 中%.1f 无名%.1f 小%.1f d49=%.2f" % (
+        angles["index"], angles["middle"], angles["ring"],
+        angles["pinky"], d49)
     if n == 4:
         return "五指", detail
     if ext["index"] and ext["middle"] and not ext["ring"] and not ext["pinky"]:
@@ -310,19 +334,63 @@ class GestureEngine(object):
         self.hand_session = InferSession(0, HAND_OM)
 
     def infer(self, bgr, depth_mm=None):
-        palms, palm_score = palm_detect(self.palm_session, self.anchors, bgr)
-        if not palms:
+        fallback_palms, palm_score = _collect_palm_candidates(
+            self.palm_session, self.anchors, bgr, PALM_FALLBACK_SCORE_TH)
+        if not fallback_palms:
             return None, None, 0.0, None, "palm 未检出（最高 %.3f）" % palm_score
+
+        normal_palms = [candidate for candidate in fallback_palms
+                        if candidate[1] > SCORE_TH]
+        primary = normal_palms[0] if normal_palms else None
+        if primary is not None:
+            alternatives = [candidate for candidate in fallback_palms
+                            if candidate[2] != primary[2]]
+        else:
+            alternatives = fallback_palms
+        alternatives = alternatives[:PALM_FALLBACK_MAX_ALTERNATIVES]
+
         if DEBUG_GESTURE:
-            _save_palm_debug(bgr, palms[0][0])
-        pre = preprocess(bgr, palms[0][0])
-        if pre is None:
-            return None, None, 0.0, None, "手部裁剪失败"
-        blob, rb, ang, rm, pad_bias = pre
-        result = postprocess(self.hand_session.infer([blob]), rb, ang, rm, pad_bias)
-        if result is None:
-            return None, None, 0.0, None, "handpose 输出解析失败"
-        lm, conf, handed = result
+            _save_palm_debug(bgr, (primary or alternatives[0])[0])
+
+        def run_candidate(candidate):
+            palm = candidate[0]
+            pre = preprocess(bgr, palm)
+            if pre is None:
+                return None, "手部裁剪失败"
+            blob, rb, ang, rm, pad_bias = pre
+            result = postprocess(
+                self.hand_session.infer([blob]), rb, ang, rm, pad_bias)
+            if result is None:
+                return None, "handpose 输出解析失败"
+            return result, None
+
+        best_result = None
+        last_error = "手部裁剪失败"
+        if primary is not None:
+            best_result, last_error = run_candidate(primary)
+            if best_result is None:
+                return None, None, 0.0, None, last_error
+            if best_result[1] >= HAND_CONF_TH:
+                alternatives = []
+
+        for rank, candidate in enumerate(alternatives, 1):
+            result, error = run_candidate(candidate)
+            if result is None:
+                last_error = error
+                continue
+            if best_result is None or result[1] > best_result[1]:
+                best_result = result
+            if DEBUG_GESTURE:
+                _, candidate_score, candidate_idx = candidate
+                source = "full" if candidate_idx < len(self.anchors) else "center"
+                anchor_idx = candidate_idx % len(self.anchors)
+                print("gesture fallback: rank=%d source=%s anchor=%d "
+                      "palm_score=%.3f hand_conf=%.3f" % (
+                          rank, source, anchor_idx, candidate_score, result[1]))
+
+        if best_result is None:
+            return None, None, 0.0, None, last_error
+        lm, conf, handed = best_result
         if conf < HAND_CONF_TH:
             return None, None, conf, None, "handpose 置信度 %.3f" % conf
         gesture, detail = classify(lm)
