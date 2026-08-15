@@ -20,7 +20,7 @@ DEBUG_GESTURE_DIR = "debug_gesture"
 
 PALM_INPUT = 192
 HAND_INPUT = np.array([224, 224])
-SCORE_TH = 0.25
+SCORE_TH = 0.35
 NMS_TH = 0.30
 HAND_CONF_TH = 0.50
 THUMB_OPEN_TH = 0.85
@@ -97,6 +97,18 @@ def nms(boxes, scores, th):
     return keep
 
 
+def palm_candidate_score(box, score, image_shape):
+    h, w = image_shape[:2]
+    bw = max(0.0, float(box[2]-box[0]))
+    bh = max(0.0, float(box[3]-box[1]))
+    area_ratio = min(1.0, bw*bh/float(w*h))
+    box_center = np.array([(box[0]+box[2])/2, (box[1]+box[3])/2])
+    image_center = np.array([w/2.0, h/2.0])
+    max_distance = np.linalg.norm(image_center) + 1e-6
+    center_score = max(0.0, 1.0-np.linalg.norm(box_center-image_center)/max_distance)
+    return float(score)*0.6 + area_ratio*0.2 + center_score*0.2
+
+
 def palm_detect(sess, anchors, bgr):
     h, w = bgr.shape[:2]
     ratio = min(PALM_INPUT/float(h), PALM_INPUT/float(w))
@@ -133,9 +145,13 @@ def palm_detect(sess, anchors, bgr):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
         _save_debug_image("palm_candidates.jpg", vis)
     sel = idx[nms(boxes[idx], score[idx], NMS_TH)]
+    final_scores = {int(i): palm_candidate_score(boxes[i], score[i], bgr.shape)
+                    for i in sel}
+    sel = sorted(sel, key=lambda i: final_scores[int(i)], reverse=True)
     print("palm candidates:")
     for i in sel:
-        print("idx=%d score=%.3f box=%s" % (i, score[i], boxes[i]))
+        print("idx=%d score=%.3f final=%.3f box=%s" % (
+            i, score[i], final_scores[int(i)], boxes[i]))
     return ([(np.concatenate([boxes[i], lms[i].reshape(-1)]).astype(np.float32),
               float(score[i])) for i in sel], float(score.max()))
 
