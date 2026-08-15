@@ -6,8 +6,9 @@ import time
 import cv2
 from PyQt5.QtWidgets import QApplication
 
-from inference.pedestrian_infer import draw_pedestrians
 from inference.pedestrian_worker import PedestrianWorker
+from ui.draw_utils import draw_text_box_bgr
+from ui.fast_draw import draw_pedestrians_fast
 
 from .base_page import BasePage
 
@@ -93,7 +94,11 @@ class PedestrianPage(BasePage):
               box[2] * total_sx, box[3] * total_sy])
             for name, score, box in self._latest_dets
         ]
-        return draw_pedestrians(small_frame, scaled_dets), self._status_text
+        rendered = draw_pedestrians_fast(small_frame, scaled_dets)
+        rendered = draw_text_box_bgr(
+            rendered, "人数: %d" % len(scaled_dets), 18, 8,
+            font_size=16, text_color=(255, 255, 0))
+        return rendered, self._status_text
 
     def on_activated(self):
         self._active = True

@@ -89,7 +89,11 @@ class GesturePage(BasePage):
         # target_scale。
         lm_scaled[:, 0] *= scale_x * target_scale
         lm_scaled[:, 1] *= scale_y * target_scale
-        rendered = draw(small_frame.copy(), lm_scaled, self._stable_gesture)
+        rendered = draw(small_frame.copy(), lm_scaled, None)
+        if self._stable_gesture != "未知":
+            rendered = draw_text_box_bgr(
+                rendered, self._stable_gesture, 20, 16, font_size=22,
+                text_color=(255, 0, 0))
         if (self._latest_distance_cm is not None
                 and self._latest_distance_cm > 0.0):
             rendered = draw_text_box_bgr(

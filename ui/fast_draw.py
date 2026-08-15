@@ -25,6 +25,18 @@ import numpy as np
 import inference.face14_infer as _f14
 
 
+def draw_pedestrians_fast(bgr, dets):
+    """绘制行人框和 ASCII 标签，中文人数由页面通过 Qt 绘制。"""
+    canvas = bgr.copy()
+    for i, (name, score, box) in enumerate(dets):
+        x1, y1, x2, y2 = [int(value) for value in box]
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        label = "person_%d %.2f" % (i + 1, score)
+        cv2.putText(canvas, label, (x1, max(0, y1 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    return canvas
+
+
 def draw_face14_fast(img_bgr, face14=None, face_box=None, score=None):
     """等效 draw_face14，但去掉引导椭圆与多余全帧拷贝。
 
