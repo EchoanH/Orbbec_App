@@ -28,6 +28,15 @@ NMS_TH = 0.30
 HAND_CONF_TH = 0.50
 THUMB_OPEN_TH = 0.85
 PIP_ANGLE_TH = 150.0
+GESTURE_VALID_CLASSES = ("五指", "拳头", "点赞", "V字")
+
+LM_SQUARE_RESCUE_SCALE = 3.0
+BBOX_SQUARE_RESCUE_SCALE = 2.5
+UNKNOWN_RESCUE_CONF_GAIN = 0.05
+MULTI_PALM_MIN_SCORE = 0.60
+MULTI_PALM_MIN_SCORE_RATIO = 0.87
+MULTI_PALM_MIN_CONF_GAIN = 0.12
+MULTI_PALM_MAX_IOU = 0.10
 
 PALM_BOX_PRE_SHIFT_VECTOR = np.array([0, 0], np.float32)
 PALM_BOX_PRE_ENLARGE_FACTOR = 4
@@ -246,6 +255,54 @@ def preprocess(image, palm):
     return np.ascontiguousarray(blob[np.newaxis,:,:,:]), rb, ang, rm, pad_bias
 
 
+def preprocess_square(image, palm, strategy, scale):
+    pad_bias = np.array([0,0], dtype=np.int32)
+    pb = palm[0:4].reshape(2,2)
+    img, pb, bias = crop_and_pad(image, pb, True)
+    if img is None: return None
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pad_bias = pad_bias + bias
+    pb = pb - pad_bias
+    plm = palm[4:18].reshape(7,2) - pad_bias
+    p1, p2 = plm[0], plm[2]
+    rad = np.pi/2 - np.arctan2(-(p2[1]-p1[1]), p2[0]-p1[0])
+    rad = rad - 2*np.pi*np.floor((rad+np.pi)/(2*np.pi))
+    ang = np.rad2deg(rad)
+    c = np.sum(pb, axis=0)/2
+    rm = cv2.getRotationMatrix2D((float(c[0]), float(c[1])), ang, 1.0)
+    rot = cv2.warpAffine(img, rm, (img.shape[1], img.shape[0]))
+    homo = np.c_[plm, np.ones(plm.shape[0])]
+    rlm = np.array([np.dot(homo, rm[0]), np.dot(homo, rm[1])])
+
+    if strategy == "lm":
+        lm_min = np.amin(rlm, axis=1)
+        lm_max = np.amax(rlm, axis=1)
+        lm_center = (lm_min + lm_max)/2
+        lm_wh = lm_max - lm_min
+        source_side = max(lm_wh[0], lm_wh[1])
+        roi_center = lm_center + PALM_BOX_SHIFT_VECTOR*source_side
+    else:
+        bbox_wh = pb[1] - pb[0]
+        source_side = max(bbox_wh[0], bbox_wh[1])
+        roi_center = c + PALM_BOX_SHIFT_VECTOR*source_side
+
+    roi_side = source_side*scale
+    half = roi_side/2
+    rb = np.round([roi_center-half, roi_center+half]).astype(np.int32)
+    rb[:,0] = np.clip(rb[:,0], 0, rot.shape[1])
+    rb[:,1] = np.clip(rb[:,1], 0, rot.shape[0])
+    crop = rot[rb[0][1]:rb[1][1], rb[0][0]:rb[1][0], :]
+    if crop.size == 0: return None
+    side = max(crop.shape[:2])
+    ph, pw = side-crop.shape[0], side-crop.shape[1]
+    l, t = pw//2, ph//2
+    crop = cv2.copyMakeBorder(crop, t, ph-t, l, pw-l,
+                              cv2.BORDER_CONSTANT, None, (0,0,0))
+    blob = cv2.resize(crop, dsize=tuple(HAND_INPUT),
+                      interpolation=cv2.INTER_AREA).astype(np.float32)/255.0
+    return np.ascontiguousarray(blob[np.newaxis,:,:,:]), rb, ang, rm, pad_bias
+
+
 def postprocess(outs, rb, ang, rm, pad_bias):
     arrs = [np.array(o).astype(np.float32) for o in outs]
     lm_l = [a for a in arrs if a.size == 63]
@@ -296,6 +353,19 @@ def classify(lm):
     if n == 0:
         return ("点赞" if thumb_open else "拳头"), detail
     return "未知", detail
+
+
+def bbox_iou(box_a, box_b):
+    x1 = max(float(box_a[0]), float(box_b[0]))
+    y1 = max(float(box_a[1]), float(box_b[1]))
+    x2 = min(float(box_a[2]), float(box_b[2]))
+    y2 = min(float(box_a[3]), float(box_b[3]))
+    inter = max(0.0, x2-x1)*max(0.0, y2-y1)
+    area_a = max(0.0, float(box_a[2]-box_a[0]))*max(
+        0.0, float(box_a[3]-box_a[1]))
+    area_b = max(0.0, float(box_b[2]-box_b[0]))*max(
+        0.0, float(box_b[3]-box_b[1]))
+    return inter/(area_a+area_b-inter+1e-9)
 
 
 def draw(vis, lm, g):
@@ -352,9 +422,16 @@ class GestureEngine(object):
         if DEBUG_GESTURE:
             _save_palm_debug(bgr, (primary or alternatives[0])[0])
 
-        def run_candidate(candidate):
+        def run_candidate(candidate, preprocess_mode="current"):
             palm = candidate[0]
-            pre = preprocess(bgr, palm)
+            if preprocess_mode == "lm_square3.0":
+                pre = preprocess_square(
+                    bgr, palm, "lm", LM_SQUARE_RESCUE_SCALE)
+            elif preprocess_mode == "bbox_square2.5":
+                pre = preprocess_square(
+                    bgr, palm, "bbox", BBOX_SQUARE_RESCUE_SCALE)
+            else:
+                pre = preprocess(bgr, palm)
             if pre is None:
                 return None, "手部裁剪失败"
             blob, rb, ang, rm, pad_bias = pre
@@ -365,11 +442,13 @@ class GestureEngine(object):
             return result, None
 
         best_result = None
+        best_candidate = None
         last_error = "手部裁剪失败"
         if primary is not None:
             best_result, last_error = run_candidate(primary)
             if best_result is None:
                 return None, None, 0.0, None, last_error
+            best_candidate = primary
             if best_result[1] >= HAND_CONF_TH:
                 alternatives = []
 
@@ -380,6 +459,7 @@ class GestureEngine(object):
                 continue
             if best_result is None or result[1] > best_result[1]:
                 best_result = result
+                best_candidate = candidate
             if DEBUG_GESTURE:
                 _, candidate_score, candidate_idx = candidate
                 source = "full" if candidate_idx < len(self.anchors) else "center"
@@ -391,9 +471,88 @@ class GestureEngine(object):
         if best_result is None:
             return None, None, 0.0, None, last_error
         lm, conf, handed = best_result
+        rescue_accepted = False
         if conf < HAND_CONF_TH:
-            return None, None, conf, None, "handpose 置信度 %.3f" % conf
-        gesture, detail = classify(lm)
+            original_conf = conf
+            rescue, _ = run_candidate(best_candidate, "lm_square3.0")
+            if rescue is not None:
+                rescue_lm, rescue_conf, rescue_handed = rescue
+                rescue_gesture, rescue_detail = classify(rescue_lm)
+                if (rescue_conf >= HAND_CONF_TH and
+                        rescue_gesture in GESTURE_VALID_CLASSES):
+                    lm, conf, handed = rescue_lm, rescue_conf, rescue_handed
+                    gesture, detail = rescue_gesture, rescue_detail
+                    rescue_accepted = True
+                    if DEBUG_GESTURE:
+                        print("gesture roi rescue: type=lm_square3.0 "
+                              "old_conf=%.3f new_conf=%.3f gesture=%s" % (
+                                  original_conf, conf, gesture))
+            if not rescue_accepted:
+                return (None, None, original_conf, None,
+                        "handpose 置信度 %.3f" % original_conf)
+
+        if not rescue_accepted:
+            gesture, detail = classify(lm)
+            if gesture == "未知":
+                rescue, _ = run_candidate(best_candidate, "bbox_square2.5")
+                if rescue is not None:
+                    rescue_lm, rescue_conf, rescue_handed = rescue
+                    rescue_gesture, rescue_detail = classify(rescue_lm)
+                    if (rescue_conf >= HAND_CONF_TH and
+                            rescue_gesture in GESTURE_VALID_CLASSES and
+                            rescue_conf-conf >= UNKNOWN_RESCUE_CONF_GAIN):
+                        old_conf = conf
+                        lm, conf, handed = rescue_lm, rescue_conf, rescue_handed
+                        gesture, detail = rescue_gesture, rescue_detail
+                        rescue_accepted = True
+                        if DEBUG_GESTURE:
+                            print("gesture roi rescue: type=bbox_square2.5 "
+                                  "old=未知 old_conf=%.3f new=%s "
+                                  "new_conf=%.3f" % (
+                                      old_conf, gesture, conf))
+
+        if not rescue_accepted and gesture in GESTURE_VALID_CLASSES:
+            selected_score = best_candidate[1]
+            selected_bbox = best_candidate[0][0:4]
+            qualifying = []
+            for order, candidate in enumerate(fallback_palms):
+                if (candidate[2] == best_candidate[2] or
+                        candidate[1] <= SCORE_TH):
+                    continue
+                alternative, _ = run_candidate(
+                    candidate, "bbox_square2.5")
+                if alternative is None:
+                    continue
+                alt_lm, alt_conf, alt_handed = alternative
+                alt_gesture, alt_detail = classify(alt_lm)
+                score_ratio = candidate[1]/selected_score
+                conf_gain = alt_conf-conf
+                iou = bbox_iou(selected_bbox, candidate[0][0:4])
+                if (alt_conf >= HAND_CONF_TH and
+                        alt_gesture in GESTURE_VALID_CLASSES and
+                        alt_gesture != gesture and
+                        candidate[1] >= MULTI_PALM_MIN_SCORE and
+                        score_ratio >= MULTI_PALM_MIN_SCORE_RATIO and
+                        conf_gain >= MULTI_PALM_MIN_CONF_GAIN and
+                        iou <= MULTI_PALM_MAX_IOU):
+                    qualifying.append((
+                        alt_conf, candidate[1], -order, alternative,
+                        alt_gesture, alt_detail, score_ratio, conf_gain, iou))
+
+            if qualifying:
+                selected = max(qualifying, key=lambda item: item[0:3])
+                old_gesture, old_conf = gesture, conf
+                old_palm_score = selected_score
+                _, new_palm_score, _, alternative, gesture, detail, \
+                    score_ratio, conf_gain, iou = selected
+                lm, conf, handed = alternative
+                if DEBUG_GESTURE:
+                    print("gesture multi-palm switch: old=%s old_conf=%.3f "
+                          "old_palm=%.3f new=%s new_conf=%.3f "
+                          "new_palm=%.3f ratio=%.3f gain=%.3f iou=%.3f" % (
+                              old_gesture, old_conf, old_palm_score,
+                              gesture, conf, new_palm_score, score_ratio,
+                              conf_gain, iou))
         distance_cm = None
         if depth_mm is not None and getattr(depth_mm, "ndim", 0) >= 2:
             depth_x, depth_y = color_to_depth_point(
