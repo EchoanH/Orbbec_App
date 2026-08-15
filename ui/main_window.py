@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMainWindow,
 from camera.capture_thread import CaptureThread
 from camera.orbbec_source import OrbbecSource
 from perf_logging import get_perf_logger
+from ui.pages.depth_page import DepthPage
 from ui.pages.enroll_page import EnrollPage
 from ui.pages.face14_page import Face14Page
 from ui.pages.gesture_page import GesturePage
@@ -36,6 +37,7 @@ class MainWindow(QMainWindow):
         ("行人检测", "pedestrian"),
         ("手势识别", "gesture"),
         ("人脸录入", "enroll"),
+        ("深度识别", "depth"),
     ]
 
     def __init__(self, yunet_session):
@@ -57,7 +59,8 @@ class MainWindow(QMainWindow):
         self._dropped_frames = 0
         self.yunet_session = yunet_session
         self.pages = [Face14Page(self.yunet_session), PedestrianPage(),
-                      GesturePage(), EnrollPage(self.yunet_session)]
+                      GesturePage(), EnrollPage(self.yunet_session),
+                      DepthPage()]
         self.nav_buttons = []
         self._build_ui()
         self.capture_thread.frame_ready.connect(self._on_capture_frame)
