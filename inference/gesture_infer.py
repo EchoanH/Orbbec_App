@@ -120,6 +120,10 @@ def palm_detect(sess, anchors, bgr):
                             cv2.BORDER_CONSTANT, None, (0,0,0))
     im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
     blob = np.ascontiguousarray(im[np.newaxis,:,:,:])
+    if DEBUG_GESTURE:
+        palm_input = np.clip(blob[0]*255.0, 0, 255).astype(np.uint8)
+        _save_debug_image("palm_input.jpg",
+                          cv2.cvtColor(palm_input, cv2.COLOR_RGB2BGR))
     pad_bias = (np.array([left, top], np.float32)/ratio).astype(np.float32)
     outs = sess.infer([blob])
     o0 = np.array(outs[0]).astype(np.float32); o1 = np.array(outs[1]).astype(np.float32)
