@@ -107,14 +107,14 @@ class ParameterControl(QWidget):
 
 class AxisDiagnostics(QGroupBox):
     FIELD_NAMES = (
-        ("error", "error"),
-        ("p_term", "P"),
-        ("i_term", "I"),
-        ("d_term", "D"),
-        ("raw_output", "PID raw"),
-        ("output", "clamped"),
-        ("accumulator", "accumulator"),
-        ("jog", "实际 JOG"),
+        ("error", "当前误差"),
+        ("p_term", "比例项 P"),
+        ("i_term", "积分项 I"),
+        ("d_term", "微分项 D"),
+        ("raw_output", "PID 原始输出"),
+        ("output", "PID 限幅输出"),
+        ("accumulator", "小数累积量"),
+        ("jog", "实际 JOG 指令"),
     )
 
     def __init__(self, title, parent=None):
@@ -206,7 +206,7 @@ class GimbalPIDTunerPage(BasePage):
     def _build_tuner_ui(self):
         base_layout = self.layout()
         video_panel = base_layout.takeAt(0).widget()
-        target_status = QLabel("IDLE · normalized X -- · Y -- · FPS 0.0")
+        target_status = QLabel("未选择目标 · 归一化 X -- · Y -- · 帧率 0.0")
         target_status.setObjectName("resultLabel")
         target_status.setFixedHeight(34)
         target_status.setStyleSheet("font-size: 13px; padding: 5px;")
@@ -217,7 +217,7 @@ class GimbalPIDTunerPage(BasePage):
         splitter.addWidget(video_panel)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(520)
+        scroll.setMinimumWidth(620)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         right = QWidget()
         self.right_layout = QVBoxLayout(right)
@@ -242,7 +242,7 @@ class GimbalPIDTunerPage(BasePage):
         self.center_button = QPushButton("云台回中")
         self.clear_button = QPushButton("清除目标")
         self.reset_button = QPushButton("PID状态清零")
-        self.get_button = QPushButton("读取云台角度 GET")
+        self.get_button = QPushButton("读取云台角度")
         self.start_button.setStyleSheet(
             "background: #2f9e72; color: white; font-weight: 700; padding: 9px;")
         self.stop_button.setStyleSheet(
@@ -260,9 +260,9 @@ class GimbalPIDTunerPage(BasePage):
         self.get_button.clicked.connect(self._request_get)
 
         self.angle_label = QLabel(
-            "STM32: pan=--  tilt=--\n"
-            "安全范围: PAN 60～120° · TILT 60～120° · "
-            "方向 PAN=-1/TILT=-1\n画面超时保护: 0.75 s")
+            "STM32：水平角=--  俯仰角=--\n"
+            "安全范围：水平轴 PAN 60～120° · 俯仰轴 TILT 60～120°\n"
+            "方向：PAN=-1 / TILT=-1 · 画面超时保护：0.75 秒")
         self.angle_label.setWordWrap(True)
         self.angle_label.setStyleSheet("color: #9fe8cf; padding: 4px;")
         grid.addWidget(self.angle_label, 3, 0, 1, 2)
@@ -273,17 +273,17 @@ class GimbalPIDTunerPage(BasePage):
 
     def _build_parameter_controls(self):
         self.parameters = {}
-        pan_group = QGroupBox("PAN PID")
+        pan_group = QGroupBox("水平轴 PAN PID 参数")
         pan_layout = QVBoxLayout(pan_group)
-        tilt_group = QGroupBox("TILT PID")
+        tilt_group = QGroupBox("俯仰轴 TILT PID 参数")
         tilt_layout = QVBoxLayout(tilt_group)
         specs = (
-            ("pan_kp", "Kp", 0.0, 10.0, 2, 0.05, pan_layout),
-            ("pan_ki", "Ki", 0.0, 2.0, 3, 0.01, pan_layout),
-            ("pan_kd", "Kd", 0.0, 2.0, 3, 0.01, pan_layout),
-            ("tilt_kp", "Kp", 0.0, 10.0, 2, 0.05, tilt_layout),
-            ("tilt_ki", "Ki", 0.0, 2.0, 3, 0.01, tilt_layout),
-            ("tilt_kd", "Kd", 0.0, 2.0, 3, 0.01, tilt_layout),
+            ("pan_kp", "水平轴比例系数 Kp", 0.0, 10.0, 2, 0.05, pan_layout),
+            ("pan_ki", "水平轴积分系数 Ki", 0.0, 2.0, 3, 0.01, pan_layout),
+            ("pan_kd", "水平轴微分系数 Kd", 0.0, 2.0, 3, 0.01, pan_layout),
+            ("tilt_kp", "俯仰轴比例系数 Kp", 0.0, 10.0, 2, 0.05, tilt_layout),
+            ("tilt_ki", "俯仰轴积分系数 Ki", 0.0, 2.0, 3, 0.01, tilt_layout),
+            ("tilt_kd", "俯仰轴微分系数 Kd", 0.0, 2.0, 3, 0.01, tilt_layout),
         )
         for key, title, minimum, maximum, decimals, step, layout in specs:
             control = ParameterControl(
@@ -296,14 +296,14 @@ class GimbalPIDTunerPage(BasePage):
         row.addWidget(tilt_group)
         self.right_layout.addLayout(row)
 
-        common_group = QGroupBox("公共控制参数（无隐藏 D 滤波）")
+        common_group = QGroupBox("公共控制参数（未启用微分低通滤波）")
         common_layout = QVBoxLayout(common_group)
         common_specs = (
-            ("deadzone_x", "DEADZONE_X", 0.0, 0.30, 3, 0.01),
-            ("deadzone_y", "DEADZONE_Y", 0.0, 0.30, 3, 0.01),
-            ("control_interval", "CONTROL_INTERVAL (s)", 0.08, 0.50, 3, 0.01),
-            ("max_jog", "MAX_JOG_DEG", 1.0, 5.0, 0, 1.0),
-            ("integral_limit", "integral limit", 0.0, 5.0, 2, 0.1),
+            ("deadzone_x", "水平死区", 0.0, 0.30, 3, 0.01),
+            ("deadzone_y", "垂直死区", 0.0, 0.30, 3, 0.01),
+            ("control_interval", "控制周期（秒）", 0.08, 0.50, 3, 0.01),
+            ("max_jog", "最大单次转角（°）", 1.0, 5.0, 0, 1.0),
+            ("integral_limit", "积分限幅", 0.0, 5.0, 2, 0.1),
         )
         for key, title, minimum, maximum, decimals, step in common_specs:
             control = ParameterControl(
@@ -314,8 +314,8 @@ class GimbalPIDTunerPage(BasePage):
         self.right_layout.addWidget(common_group)
 
     def _build_diagnostics(self):
-        self.pan_diagnostics = AxisDiagnostics("PAN 实时诊断")
-        self.tilt_diagnostics = AxisDiagnostics("TILT 实时诊断")
+        self.pan_diagnostics = AxisDiagnostics("水平轴 PAN 实时诊断")
+        self.tilt_diagnostics = AxisDiagnostics("俯仰轴 TILT 实时诊断")
         self.right_layout.addWidget(self.pan_diagnostics)
         self.right_layout.addWidget(self.tilt_diagnostics)
 
@@ -381,7 +381,7 @@ class GimbalPIDTunerPage(BasePage):
                 self._tracking_state = TargetTracker.LOST
                 self._normalized_center = None
                 self._stop_auto_control(
-                    "LOST：已停止自动输出并清空 PID")
+                    "目标丢失：已停止自动输出并清空 PID")
             else:
                 self._tracking_state = TargetTracker.TRACKING
                 self._normalized_center = normalized_bbox_center(
@@ -511,16 +511,26 @@ class GimbalPIDTunerPage(BasePage):
 
     def _update_target_status(self):
         if self._normalized_center is None:
-            coordinates = "normalized X -- · Y --"
+            coordinates = "归一化 X -- · Y --"
         else:
-            coordinates = "normalized X %+.3f · Y %+.3f" % (
+            coordinates = "归一化 X %+.3f · Y %+.3f" % (
                 self._normalized_center)
+        state_text = {
+            TargetTracker.IDLE: "未选择目标",
+            TargetTracker.TRACKING: "跟踪中",
+            TargetTracker.LOST: "目标丢失",
+        }.get(self._tracking_state, str(self._tracking_state))
         self.target_status.setText(
-            "%s · %s · FPS %.1f" % (
-                self._tracking_state, coordinates, self._display_fps))
+            "%s · %s · 帧率 %.1f" % (
+                state_text, coordinates, self._display_fps))
 
     def _combined_status(self):
-        return "%s · %s" % (self._tracking_state, self._gimbal_status)
+        state_text = {
+            TargetTracker.IDLE: "未选择目标",
+            TargetTracker.TRACKING: "跟踪中",
+            TargetTracker.LOST: "目标丢失",
+        }.get(self._tracking_state, str(self._tracking_state))
+        return "%s · %s" % (state_text, self._gimbal_status)
 
     def _start_gimbal_worker(self):
         if self._gimbal_worker is not None:
@@ -549,7 +559,7 @@ class GimbalPIDTunerPage(BasePage):
             return
         if self._pan_angle is None or self._tilt_angle is None:
             QMessageBox.warning(
-                self, "无法启动", "尚未获得真实角度，请先点击 GET 或 CENTER。")
+                self, "无法启动", "尚未获得真实角度，请先读取角度或执行云台回中。")
             return
         if not (PAN_SAFE_MIN <= self._pan_angle <= PAN_SAFE_MAX and
                 TILT_SAFE_MIN <= self._tilt_angle <= TILT_SAFE_MAX):
@@ -604,7 +614,7 @@ class GimbalPIDTunerPage(BasePage):
             worker.request_get()
 
     def _center_gimbal(self):
-        self._stop_auto_control("CENTER：已停止并清空 PID")
+        self._stop_auto_control("云台回中：已停止并清空 PID")
         worker = self._gimbal_worker
         if worker is not None and worker.isRunning():
             worker.request_center()
@@ -706,15 +716,16 @@ class GimbalPIDTunerPage(BasePage):
             self._pan_angle = None
             self._tilt_angle = None
             self.angle_label.setText(
-                "STM32: 回复未包含 pan/tilt，自动控制已禁止\n%s" % response)
+                "STM32：回复未包含水平角/俯仰角，自动控制已禁止\n%s" % response)
             if self._auto_enabled:
                 self._stop_auto_control("角度解析失败：已立即停止")
         else:
             self._pan_angle, self._tilt_angle = angles
             self.angle_label.setText(
-                "STM32: pan=%.2f°  tilt=%.2f°\n"
-                "安全范围: PAN %.0f～%.0f° · TILT %.0f～%.0f° · "
-                "方向 PAN=-1/TILT=-1\n画面超时保护: %.2f s" % (
+                "STM32：水平角=%.2f°  俯仰角=%.2f°\n"
+                "安全范围：水平轴 PAN %.0f～%.0f° · "
+                "俯仰轴 TILT %.0f～%.0f°\n"
+                "方向：PAN=-1 / TILT=-1 · 画面超时保护：%.2f 秒" % (
                     self._pan_angle, self._tilt_angle,
                     PAN_SAFE_MIN, PAN_SAFE_MAX,
                     TILT_SAFE_MIN, TILT_SAFE_MAX,

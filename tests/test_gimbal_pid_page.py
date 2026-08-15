@@ -7,7 +7,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel
 
 from gimbal.controller import GimbalWorker
 from inference.target_tracker import TargetTracker
@@ -112,7 +112,22 @@ class GimbalPageLifecycleTests(unittest.TestCase):
         rendered, _status = page.process_frame(frame, frame, None)
         page.show_frame(rendered)
         self.assertEqual(page._tracking_state, TargetTracker.TRACKING)
-        self.assertIn("TRACKING", page.target_status.text())
+        self.assertIn("跟踪中", page.target_status.text())
+
+        labels = {label.text() for label in page.findChildren(QLabel)}
+        for expected in (
+                "水平轴比例系数 Kp", "水平轴积分系数 Ki",
+                "水平轴微分系数 Kd", "俯仰轴比例系数 Kp",
+                "俯仰轴积分系数 Ki", "俯仰轴微分系数 Kd",
+                "水平死区", "垂直死区", "控制周期（秒）",
+                "最大单次转角（°）", "积分限幅", "当前误差",
+                "比例项 P", "积分项 I", "微分项 D",
+                "PID 原始输出", "小数累积量", "实际 JOG 指令"):
+            self.assertIn(expected, labels)
+        group_titles = {
+            group.title() for group in page.findChildren(QGroupBox)}
+        self.assertIn("水平轴 PAN PID 参数", group_titles)
+        self.assertIn("俯仰轴 TILT PID 参数", group_titles)
 
         page.on_deactivated()
         self.assertEqual(ownership.active, 0)

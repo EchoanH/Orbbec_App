@@ -32,7 +32,7 @@ class GimbalPIDTuner(QMainWindow):
         self._capture_thread = CaptureThread(self._source, parent=self)
         self.page = GimbalPIDTunerPage(parent=self)
         self.setCentralWidget(self.page)
-        mode_warning = QLabel("独立模式运行前必须关闭主 GUI")
+        mode_warning = QLabel("独立模式运行前必须关闭主程序")
         mode_warning.setStyleSheet("color: #ffd58a; font-weight: 700;")
         self.statusBar().addPermanentWidget(mode_warning)
         self.statusBar().showMessage("自动控制默认关闭")
@@ -61,7 +61,7 @@ class GimbalPIDTuner(QMainWindow):
 
     @pyqtSlot(float)
     def _on_fps(self, fps):
-        self.statusBar().showMessage("采集 FPS %.1f" % float(fps))
+        self.statusBar().showMessage("采集帧率 %.1f" % float(fps))
 
     def closeEvent(self, event):
         self._shutdown()
