@@ -32,6 +32,7 @@ class GimbalWorker(QThread):
     status_changed = pyqtSignal(str)
     connection_changed = pyqtSignal(bool)
     response_received = pyqtSignal(str)
+    command_completed = pyqtSignal(str, str)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, port=DEFAULT_PORT, serial_factory=None, parent=None):
@@ -146,6 +147,7 @@ class GimbalWorker(QThread):
         if not response.startswith("GIMBAL"):
             raise GimbalProtocolError("未知回复：%s" % response)
         self.response_received.emit(response)
+        self.command_completed.emit(command, response)
         self.status_changed.emit("云台已连接")
         return response
 
