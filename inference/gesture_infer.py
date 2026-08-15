@@ -121,7 +121,11 @@ def palm_detect(sess, anchors, bgr):
     m = score > SCORE_TH
     if m.sum() == 0: return [], float(score.max())
     idx = np.where(m)[0]
+    print("score candidates:", len(idx))
     sel = idx[nms(boxes[idx], score[idx], NMS_TH)]
+    print("palm candidates:")
+    for i in sel:
+        print("idx=%d score=%.3f box=%s" % (i, score[i], boxes[i]))
     return ([(np.concatenate([boxes[i], lms[i].reshape(-1)]).astype(np.float32),
               float(score[i])) for i in sel], float(score.max()))
 
