@@ -122,6 +122,15 @@ def palm_detect(sess, anchors, bgr):
     if m.sum() == 0: return [], float(score.max())
     idx = np.where(m)[0]
     print("score candidates:", len(idx))
+    if DEBUG_GESTURE:
+        vis = bgr.copy()
+        for i in idx:
+            box = boxes[i].astype(np.int32)
+            cv2.rectangle(vis, tuple(box[0:2]), tuple(box[2:4]), (0,255,0), 2)
+            cv2.putText(vis, "idx=%d score=%.3f" % (i, score[i]),
+                        (box[0], max(15, box[1]-5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+        _save_debug_image("palm_candidates.jpg", vis)
     sel = idx[nms(boxes[idx], score[idx], NMS_TH)]
     print("palm candidates:")
     for i in sel:
