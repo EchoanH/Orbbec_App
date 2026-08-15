@@ -1,7 +1,8 @@
 #!/bin/bash
 LOGFILE=/root/echo/app/logs/desktop_launch_$(date +%Y%m%d_%H%M%S).log
 export DISPLAY=:0
-export PYTHONPATH=/root/echo/qt5lib
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export PYTHONPATH=/root/echo/qt5lib:${PYTHONPATH:-}
 
 /home/HwHiAiUser/experiment_box_host/.venv/bin/python /root/echo/app/main.py > "$LOGFILE" 2>&1
 EXIT_CODE=$?
