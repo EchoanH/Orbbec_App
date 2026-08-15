@@ -1,7 +1,10 @@
+import os
 import time
 import unittest
 
-from PyQt5.QtCore import QCoreApplication
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt5.QtWidgets import QApplication
 
 from gimbal.controller import GimbalWorker
 
@@ -48,7 +51,7 @@ class FakeSerial(object):
 class GimbalWorkerFakeSerialTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.app = QCoreApplication.instance() or QCoreApplication([])
+        cls.app = QApplication.instance() or QApplication([])
 
     def _wait_until(self, condition, timeout=2.0):
         deadline = time.monotonic() + timeout

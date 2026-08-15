@@ -16,6 +16,7 @@ from perf_logging import get_perf_logger
 from ui.pages.depth_page import DepthPage
 from ui.pages.enroll_page import EnrollPage
 from ui.pages.face14_page import Face14Page
+from ui.pages.gimbal_pid_tuner_page import GimbalPIDTunerPage
 from ui.pages.gesture_page import GesturePage
 from ui.pages.pedestrian_page import PedestrianPage
 from ui.pages.target_tracking_page import TargetTrackingPage
@@ -40,6 +41,7 @@ class MainWindow(QMainWindow):
         ("人脸录入", "enroll"),
         ("深度识别", "depth"),
         ("动态目标跟踪", "target_tracking"),
+        ("云台 PID 调试", "gimbal_pid_tuner"),
     ]
 
     def __init__(self, yunet_session):
@@ -62,7 +64,8 @@ class MainWindow(QMainWindow):
         self.yunet_session = yunet_session
         self.pages = [Face14Page(self.yunet_session), PedestrianPage(),
                       GesturePage(), EnrollPage(self.yunet_session),
-                      DepthPage(), TargetTrackingPage()]
+                      DepthPage(), TargetTrackingPage(),
+                      GimbalPIDTunerPage()]
         self.nav_buttons = []
         self._build_ui()
         self.capture_thread.frame_ready.connect(self._on_capture_frame)
@@ -227,6 +230,10 @@ class MainWindow(QMainWindow):
     def _on_error(self, text):
         LOGGER.warning(text)
         self.status_label.setText("摄像头未连接")
+        current_page = self.pages[self.stack.currentIndex()]
+        error_handler = getattr(current_page, "on_camera_error", None)
+        if error_handler is not None:
+            error_handler(text)
         for page in self.pages:
             page.video_label.setText("摄像头未连接\n\n%s" % text)
 
@@ -243,6 +250,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.render_timer.isActive():
             self.render_timer.stop()
+        self.pages[self.stack.currentIndex()].on_deactivated()
         if self.capture_thread.isRunning():
             self.capture_thread.stop()
             self.capture_thread.wait()
