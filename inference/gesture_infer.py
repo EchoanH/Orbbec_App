@@ -116,19 +116,10 @@ def crop_and_pad(image, palm_bbox, for_rotation=False):
     sc = PALM_BOX_PRE_ENLARGE_FACTOR if for_rotation else PALM_BOX_ENLARGE_FACTOR
     half = wh*sc/2
     palm_bbox = np.array([center-half, center+half]).astype(np.int32)
-    clipped_bbox = palm_bbox.copy()
-    clipped_bbox[:,0] = np.clip(clipped_bbox[:,0], 0, image.shape[1])
-    clipped_bbox[:,1] = np.clip(clipped_bbox[:,1], 0, image.shape[0])
-    image = image[clipped_bbox[0][1]:clipped_bbox[1][1],
-                  clipped_bbox[0][0]:clipped_bbox[1][0], :]
+    palm_bbox[:,0] = np.clip(palm_bbox[:,0], 0, image.shape[1])
+    palm_bbox[:,1] = np.clip(palm_bbox[:,1], 0, image.shape[0])
+    image = image[palm_bbox[0][1]:palm_bbox[1][1], palm_bbox[0][0]:palm_bbox[1][0], :]
     if image.size == 0: return None, palm_bbox, np.array([0,0], np.int32)
-    image = cv2.copyMakeBorder(
-        image,
-        clipped_bbox[0][1]-palm_bbox[0][1],
-        palm_bbox[1][1]-clipped_bbox[1][1],
-        clipped_bbox[0][0]-palm_bbox[0][0],
-        palm_bbox[1][0]-clipped_bbox[1][0],
-        cv2.BORDER_CONSTANT, None, (0,0,0))
     side = int(np.linalg.norm(image.shape[:2]) if for_rotation else max(image.shape[:2]))
     ph, pw = side-image.shape[0], side-image.shape[1]
     l, t = pw//2, ph//2
