@@ -26,14 +26,11 @@ import inference.face14_infer as _f14
 
 
 def draw_pedestrians_fast(bgr, dets):
-    """绘制行人框和 ASCII 标签，中文人数由页面通过 Qt 绘制。"""
+    """绘制行人框，中文标签由页面通过 Qt 绘制。"""
     canvas = bgr.copy()
-    for i, (name, score, box) in enumerate(dets):
+    for _, _, box in dets:
         x1, y1, x2, y2 = [int(value) for value in box]
         cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        label = "person_%d %.2f" % (i + 1, score)
-        cv2.putText(canvas, label, (x1, max(0, y1 - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     return canvas
 
 
@@ -60,17 +57,6 @@ def draw_face14_fast(img_bgr, face14=None, face_box=None, score=None):
     x2 = max(0, min(width - 1, x2))
     y2 = max(0, min(height - 1, y2))
     cv2.rectangle(canvas, (x1, y1), (x2, y2), _f14.FACE_BOX_COLOR, 2)
-
-    label = "conf %.3f" % float(score)
-    (text_w, text_h), baseline = cv2.getTextSize(
-        label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-    label_y = max(0, y1 - text_h - baseline - 8)
-    cv2.rectangle(canvas, (x1, label_y),
-                  (x1 + text_w + 12, label_y + text_h + baseline + 8),
-                  _f14.FACE_BOX_COLOR, -1)
-    cv2.putText(canvas, label, (x1 + 6, label_y + text_h + 3),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, _f14.FACE_BOX_TEXT_COLOR, 2,
-                cv2.LINE_AA)
 
     for part, names in part_map.items():
         color = _f14.PART_COLOR[part]

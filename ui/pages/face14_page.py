@@ -132,6 +132,13 @@ class Face14Page(BasePage):
             draw_started_ns = time.perf_counter_ns()
             rendered = draw_face14_fast(small_frame, face14_scaled,
                                         face_box_scaled, self._latest_score)
+            if face_box_scaled is not None:
+                x1, y1 = face_box_scaled[:2]
+                rendered = draw_text_box_bgr(
+                    rendered, "置信度 %.3f" % self._latest_score,
+                    x1, y1 - 32, font_size=15,
+                    text_color=(8, 19, 31),
+                    background_color=(74, 158, 255))
             PERF.event("诊断process_frame绘制耗时",
                        (time.perf_counter_ns() - draw_started_ns) / 1e6)
             if (self._latest_distance_cm is not None

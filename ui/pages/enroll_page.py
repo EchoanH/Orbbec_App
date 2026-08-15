@@ -180,11 +180,11 @@ class EnrollPage(BasePage):
         if box is not None:
             label = self._stable_name or "识别中"
             if self._stable_name:
-                label = "%s %.2f · conf %.3f" % (
+                label = "%s · 相似度 %.2f · 置信度 %.3f" % (
                     self._stable_name, self._latest_similarity,
                     self._latest_detection_score)
             else:
-                label = "识别中 · conf %.3f" % self._latest_detection_score
+                label = "识别中 · 置信度 %.3f" % self._latest_detection_score
         return self._draw_match(small_frame, box_scaled, label), self._status_text
 
     def on_activated(self):

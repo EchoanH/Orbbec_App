@@ -95,6 +95,11 @@ class PedestrianPage(BasePage):
             for name, score, box in self._latest_dets
         ]
         rendered = draw_pedestrians_fast(small_frame, scaled_dets)
+        for index, (_, score, box) in enumerate(scaled_dets, 1):
+            rendered = draw_text_box_bgr(
+                rendered, "行人%d · 置信度 %.2f" % (index, score),
+                box[0], box[1] - 26, font_size=12,
+                text_color=(0, 255, 0), padding=2)
         rendered = draw_text_box_bgr(
             rendered, "人数: %d" % len(scaled_dets), 18, 8,
             font_size=16, text_color=(255, 255, 0))
