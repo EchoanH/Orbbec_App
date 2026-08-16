@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""独立启动壳层：复用主 GUI 的云台 PID 调试页面。"""
+"""独立启动壳层：复用完整诊断页与共享 PID 参数控件。"""
 
 import logging
 import sys
@@ -21,7 +21,7 @@ from ui.pages.gimbal_pid_tuner_page import GimbalPIDTunerPage
 
 
 class GimbalPIDTuner(QMainWindow):
-    """独立模式仅拥有相机壳层；PID UI/控制逻辑由共享页面提供。"""
+    """独立模式拥有相机壳层；PID 参数 UI 由共享控件提供。"""
 
     def __init__(self):
         super(GimbalPIDTuner, self).__init__()

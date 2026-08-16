@@ -8,10 +8,12 @@ from PyQt5.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
                              QPushButton)
 
 from gimbal.controller import GimbalWorker
-from gimbal.pid import PIDAxis, parse_gimbal_angles, safe_jog_for_angle
+from gimbal.pid import (PIDAxis, PIDDiagnostics, parse_gimbal_angles,
+                        safe_jog_for_angle)
 from gimbal.pid_config import get_default_pid_config, load_pid_config
 from inference.target_tracker import TargetTracker, normalized_bbox_center
 from ui.draw_utils import draw_text_box_bgr
+from ui.pid_parameter_widget import PIDParameterDialog
 
 from .base_page import BasePage
 
@@ -42,6 +44,12 @@ class TargetTrackingPage(BasePage):
         self._tilt_pid = PIDAxis()
         self._pid_config = get_default_pid_config()
         self._config_status = "PID 参数：默认配置"
+        self._config_source_text = "当前参数来源：默认配置"
+        self._pid_dialog = None
+        self._last_pan_sample = PIDDiagnostics()
+        self._last_tilt_sample = PIDDiagnostics()
+        self._last_pan_jog = 0
+        self._last_tilt_jog = 0
         self._latest_bgr = None
         self._source_size = None
         self._selecting = False
@@ -91,6 +99,11 @@ class TargetTrackingPage(BasePage):
         self.follow_button.setCheckable(True)
         self.follow_button.toggled.connect(self._on_follow_toggled)
         controls.addWidget(self.follow_button)
+
+        self.pid_button = QPushButton("PID调试")
+        self.pid_button.setObjectName("primaryButton")
+        self.pid_button.clicked.connect(self._show_pid_dialog)
+        controls.addWidget(self.pid_button)
 
         self.center_button = QPushButton("云台回中")
         self.center_button.setObjectName("primaryButton")
@@ -266,6 +279,40 @@ class TargetTrackingPage(BasePage):
         return "%s · %s · %s" % (
             self._tracking_status, self._gimbal_status, self._config_status)
 
+    def _show_pid_dialog(self):
+        if self._pid_dialog is None:
+            dialog = PIDParameterDialog(
+                config_path=self._config_path,
+                initial_values=self._pid_config,
+                initial_source=self._config_source_text,
+                parent=self)
+            parameter_widget = dialog.parameter_widget
+            parameter_widget.values_changed.connect(
+                self._apply_runtime_pid_config)
+            parameter_widget.reset_requested.connect(self._reset_pid_state)
+            parameter_widget.config_source_changed.connect(
+                self._on_pid_config_source_changed)
+            self._pid_dialog = dialog
+        self._update_pid_dialog_diagnostics()
+        self._pid_dialog.show()
+        self._pid_dialog.raise_()
+        self._pid_dialog.activateWindow()
+
+    def _apply_runtime_pid_config(self, values):
+        self._pid_config = dict(values)
+
+    def _on_pid_config_source_changed(self, source_text):
+        self._config_source_text = source_text
+        self._config_status = source_text.replace(
+            "当前参数来源", "PID 参数", 1)
+
+    def _update_pid_dialog_diagnostics(self):
+        if self._pid_dialog is None:
+            return
+        self._pid_dialog.parameter_widget.update_diagnostics(
+            self._last_pan_sample, self._last_pan_jog,
+            self._last_tilt_sample, self._last_tilt_jog)
+
     def _start_gimbal_worker(self):
         if self._gimbal_worker is not None:
             if not self._gimbal_worker.isFinished():
@@ -386,6 +433,11 @@ class TargetTrackingPage(BasePage):
         tilt_delta = self._safe_signed_jog(
             "TILT", tilt_sample.jog, TILT_SIGN, self._tilt_angle,
             TILT_SAFE_MIN, TILT_SAFE_MAX, self._tilt_pid)
+        self._last_pan_sample = pan_sample
+        self._last_tilt_sample = tilt_sample
+        self._last_pan_jog = pan_delta
+        self._last_tilt_jog = tilt_delta
+        self._update_pid_dialog_diagnostics()
         if pan_delta:
             self._pending_auto["PAN"] = (
                 self._pan_pid, pan_delta * PAN_SIGN)
@@ -420,6 +472,9 @@ class TargetTrackingPage(BasePage):
             return
         pid_axis, logical_jog = pending
         pid_axis.consume_jog(logical_jog)
+        if self._pid_dialog is not None:
+            self._pid_dialog.parameter_widget.set_accumulator(
+                axis_name, pid_axis.accumulator)
 
     def _on_gimbal_response(self, response):
         angles = parse_gimbal_angles(response)
@@ -439,6 +494,12 @@ class TargetTrackingPage(BasePage):
         self._tilt_pid.reset()
         self._pending_auto.clear()
         self._last_pid_time = None
+        self._last_pan_sample = PIDDiagnostics()
+        self._last_tilt_sample = PIDDiagnostics()
+        self._last_pan_jog = 0
+        self._last_tilt_jog = 0
+        if self._pid_dialog is not None:
+            self._pid_dialog.parameter_widget.reset_diagnostics()
 
     def _stop_auto_control(self):
         if self._gimbal_worker is not None:
@@ -451,10 +512,18 @@ class TargetTrackingPage(BasePage):
         self._pid_config = result.values
         if result.error:
             self._config_status = result.error
+            self._config_source_text = "当前参数来源：默认配置"
         elif result.source == "saved":
             self._config_status = "PID 参数：已保存配置"
+            self._config_source_text = "当前参数来源：已保存配置"
         else:
             self._config_status = "PID 参数：默认配置"
+            self._config_source_text = "当前参数来源：默认配置"
+        if self._pid_dialog is not None:
+            self._pid_dialog.parameter_widget.apply_pid_config(
+                self._pid_config,
+                source_text=self._config_source_text,
+                emit_change=False)
         return result
 
     def on_activated(self):
@@ -466,6 +535,8 @@ class TargetTrackingPage(BasePage):
 
     def on_deactivated(self):
         self._active = False
+        if self._pid_dialog is not None:
+            self._pid_dialog.hide()
         self.clear_target()
         if self.follow_button.isChecked():
             self.follow_button.setChecked(False)

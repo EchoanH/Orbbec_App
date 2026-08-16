@@ -1,23 +1,18 @@
-"""主 GUI 与独立入口共用的云台 PID 调试页面。"""
+"""独立诊断工具使用的完整云台 PID 调试页面。"""
 
 import time
 from collections import deque
 
 import cv2
-from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication,
-    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
-    QHBoxLayout,
     QLabel,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
-    QSlider,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -30,13 +25,12 @@ from gimbal.pid import (
     parse_gimbal_angles,
     safe_jog_for_angle,
 )
-from gimbal.pid_config import (
-    PIDConfigError,
-    get_default_pid_config,
-    load_pid_config,
-    save_pid_config,
-)
 from inference.target_tracker import TargetTracker, normalized_bbox_center
+from ui.pid_parameter_widget import (
+    AxisDiagnostics,
+    ParameterControl,
+    PIDParameterWidget,
+)
 
 from .base_page import BasePage
 
@@ -49,124 +43,6 @@ PAN_SAFE_MAX = 120.0
 TILT_SAFE_MIN = 60.0
 TILT_SAFE_MAX = 120.0
 TRACKING_FRAME_TIMEOUT_S = 0.75
-
-_DEFAULT_PID_CONFIG = get_default_pid_config()
-INITIAL_VALUES = {
-    "pan_kp": _DEFAULT_PID_CONFIG["pan_kp"],
-    "pan_ki": _DEFAULT_PID_CONFIG["pan_ki"],
-    "pan_kd": _DEFAULT_PID_CONFIG["pan_kd"],
-    "tilt_kp": _DEFAULT_PID_CONFIG["tilt_kp"],
-    "tilt_ki": _DEFAULT_PID_CONFIG["tilt_ki"],
-    "tilt_kd": _DEFAULT_PID_CONFIG["tilt_kd"],
-    "deadzone_x": _DEFAULT_PID_CONFIG["deadzone_x"],
-    "deadzone_y": _DEFAULT_PID_CONFIG["deadzone_y"],
-    "control_interval": _DEFAULT_PID_CONFIG["control_interval_s"],
-    "max_jog": _DEFAULT_PID_CONFIG["max_jog_deg"],
-    "integral_limit": _DEFAULT_PID_CONFIG["integral_limit"],
-}
-
-_UI_TO_CONFIG_KEYS = {
-    "pan_kp": "pan_kp",
-    "pan_ki": "pan_ki",
-    "pan_kd": "pan_kd",
-    "tilt_kp": "tilt_kp",
-    "tilt_ki": "tilt_ki",
-    "tilt_kd": "tilt_kd",
-    "deadzone_x": "deadzone_x",
-    "deadzone_y": "deadzone_y",
-    "control_interval": "control_interval_s",
-    "max_jog": "max_jog_deg",
-    "integral_limit": "integral_limit",
-}
-
-
-class ParameterControl(QWidget):
-    value_changed = pyqtSignal(float)
-
-    def __init__(self, title, minimum, maximum, value, decimals, step,
-                 parent=None):
-        super(ParameterControl, self).__init__(parent)
-        self._scale = 10 ** int(decimals)
-        title_label = QLabel(title)
-        self._slider = QSlider(Qt.Horizontal)
-        self._slider.setRange(
-            int(round(minimum * self._scale)),
-            int(round(maximum * self._scale)),
-        )
-        self._spinbox = QDoubleSpinBox()
-        self._spinbox.setDecimals(decimals)
-        self._spinbox.setRange(minimum, maximum)
-        self._spinbox.setSingleStep(step)
-        self._spinbox.setFixedWidth(88)
-        layout = QGridLayout(self)
-        layout.setContentsMargins(0, 1, 0, 1)
-        layout.addWidget(title_label, 0, 0, 1, 2)
-        layout.addWidget(self._slider, 1, 0)
-        layout.addWidget(self._spinbox, 1, 1)
-        self._slider.valueChanged.connect(self._on_slider_changed)
-        self._spinbox.valueChanged.connect(self._on_spinbox_changed)
-        self.set_value(value)
-
-    def value(self):
-        return float(self._spinbox.value())
-
-    def set_value(self, value):
-        self._spinbox.setValue(float(value))
-
-    def _on_slider_changed(self, value):
-        spin_value = value / float(self._scale)
-        self._spinbox.blockSignals(True)
-        self._spinbox.setValue(spin_value)
-        self._spinbox.blockSignals(False)
-        self.value_changed.emit(spin_value)
-
-    def _on_spinbox_changed(self, value):
-        self._slider.blockSignals(True)
-        self._slider.setValue(int(round(value * self._scale)))
-        self._slider.blockSignals(False)
-        self.value_changed.emit(float(value))
-
-
-class AxisDiagnostics(QGroupBox):
-    FIELD_NAMES = (
-        ("error", "当前误差"),
-        ("p_term", "比例项 P"),
-        ("i_term", "积分项 I"),
-        ("d_term", "微分项 D"),
-        ("raw_output", "PID 原始输出"),
-        ("output", "PID 限幅输出"),
-        ("accumulator", "小数累积量"),
-        ("jog", "实际 JOG 指令"),
-    )
-
-    def __init__(self, title, parent=None):
-        super(AxisDiagnostics, self).__init__(title, parent)
-        self._values = {}
-        grid = QGridLayout(self)
-        grid.setVerticalSpacing(3)
-        for row, (key, caption) in enumerate(self.FIELD_NAMES):
-            grid.addWidget(QLabel(caption), row, 0)
-            value = QLabel("0.000")
-            value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            value.setStyleSheet("color: #9fe8cf; font-family: monospace;")
-            grid.addWidget(value, row, 1)
-            self._values[key] = value
-
-    def update_sample(self, sample, final_jog):
-        self._values["error"].setText("%+.4f" % sample.error)
-        self._values["p_term"].setText("%+.4f" % sample.p_term)
-        self._values["i_term"].setText("%+.4f" % sample.i_term)
-        self._values["d_term"].setText("%+.4f" % sample.d_term)
-        self._values["raw_output"].setText("%+.4f" % sample.raw_output)
-        self._values["output"].setText("%+.4f" % sample.output)
-        self._values["accumulator"].setText("%+.4f" % sample.accumulator)
-        self._values["jog"].setText("%+d°" % int(final_jog))
-
-    def set_accumulator(self, value):
-        self._values["accumulator"].setText("%+.4f" % float(value))
-
-    def reset_values(self):
-        self.update_sample(PIDDiagnostics(), 0)
 
 
 class GimbalPIDTunerPage(BasePage):
@@ -210,7 +86,7 @@ class GimbalPIDTunerPage(BasePage):
         self._control_timer = QTimer(self)
         self._control_timer.setTimerType(Qt.PreciseTimer)
         self._control_timer.timeout.connect(self._control_tick)
-        self._load_saved_parameters(announce=True)
+        self._parameters_changed()
         self.video_label.setMouseTracking(True)
         self.video_label.setCursor(Qt.CrossCursor)
         self.video_label.installEventFilter(self)
@@ -253,9 +129,7 @@ class GimbalPIDTunerPage(BasePage):
         base_layout.addWidget(splitter, 1)
 
         self._build_action_buttons()
-        self._build_parameter_controls()
-        self._build_diagnostics()
-        self._build_parameter_export()
+        self._build_parameter_panel()
         self.right_layout.addStretch(1)
 
     def _build_action_buttons(self):
@@ -295,170 +169,62 @@ class GimbalPIDTunerPage(BasePage):
         grid.addWidget(self.control_status, 4, 0, 1, 2)
         self.right_layout.addWidget(group)
 
-    def _build_parameter_controls(self):
-        self.parameters = {}
-        pan_group = QGroupBox("水平轴 PAN PID 参数")
-        pan_layout = QVBoxLayout(pan_group)
-        tilt_group = QGroupBox("俯仰轴 TILT PID 参数")
-        tilt_layout = QVBoxLayout(tilt_group)
-        specs = (
-            ("pan_kp", "水平轴比例系数 Kp", 0.0, 10.0, 2, 0.05, pan_layout),
-            ("pan_ki", "水平轴积分系数 Ki", 0.0, 2.0, 3, 0.01, pan_layout),
-            ("pan_kd", "水平轴微分系数 Kd", 0.0, 2.0, 3, 0.01, pan_layout),
-            ("tilt_kp", "俯仰轴比例系数 Kp", 0.0, 10.0, 2, 0.05, tilt_layout),
-            ("tilt_ki", "俯仰轴积分系数 Ki", 0.0, 2.0, 3, 0.01, tilt_layout),
-            ("tilt_kd", "俯仰轴微分系数 Kd", 0.0, 2.0, 3, 0.01, tilt_layout),
-        )
-        for key, title, minimum, maximum, decimals, step, layout in specs:
-            control = ParameterControl(
-                title, minimum, maximum, INITIAL_VALUES[key], decimals, step)
-            control.value_changed.connect(self._parameters_changed)
-            self.parameters[key] = control
-            layout.addWidget(control)
-        row = QHBoxLayout()
-        row.addWidget(pan_group)
-        row.addWidget(tilt_group)
-        self.right_layout.addLayout(row)
+    def _build_parameter_panel(self):
+        self.parameter_widget = PIDParameterWidget(
+            config_path=self._config_path, auto_load=True, parent=self)
+        self.parameter_widget.values_changed.connect(
+            self._parameters_changed)
+        self.parameter_widget.configuration_action_started.connect(
+            lambda: self._stop_auto_control("参数操作前已停止自动控制"))
+        self.parameter_widget.reset_requested.connect(self._reset_pid_state)
+        self.parameter_widget.feedback_changed.connect(
+            self.control_status.setText)
 
-        common_group = QGroupBox("公共控制参数（未启用微分低通滤波）")
-        common_layout = QVBoxLayout(common_group)
-        common_specs = (
-            ("deadzone_x", "水平死区", 0.0, 0.30, 3, 0.01),
-            ("deadzone_y", "垂直死区", 0.0, 0.30, 3, 0.01),
-            ("control_interval", "控制周期（秒）", 0.08, 0.50, 3, 0.01),
-            ("max_jog", "最大单次转角（°）", 1.0, 5.0, 0, 1.0),
-            ("integral_limit", "积分限幅", 0.0, 5.0, 2, 0.1),
-        )
-        for key, title, minimum, maximum, decimals, step in common_specs:
-            control = ParameterControl(
-                title, minimum, maximum, INITIAL_VALUES[key], decimals, step)
-            control.value_changed.connect(self._parameters_changed)
-            self.parameters[key] = control
-            common_layout.addWidget(control)
-        self.right_layout.addWidget(common_group)
-
-    def _build_diagnostics(self):
-        self.pan_diagnostics = AxisDiagnostics("水平轴 PAN 实时诊断")
-        self.tilt_diagnostics = AxisDiagnostics("俯仰轴 TILT 实时诊断")
-        self.right_layout.addWidget(self.pan_diagnostics)
-        self.right_layout.addWidget(self.tilt_diagnostics)
-
-    def _build_parameter_export(self):
-        group = QGroupBox("当前最终参数（保存后供动态跟踪使用）")
-        layout = QVBoxLayout(group)
-        self.parameter_text = QPlainTextEdit()
-        self.parameter_text.setReadOnly(True)
-        self.parameter_text.setMaximumHeight(235)
-        self.config_source_label = QLabel("当前参数来源：默认配置")
-        self.config_source_label.setWordWrap(True)
-        self.config_source_label.setSizePolicy(
-            QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.config_source_label.setStyleSheet("color: #9fe8cf;")
-        button_grid = QGridLayout()
-        self.save_button = QPushButton("保存当前参数")
-        self.save_button.setStyleSheet(
-            "background: #2f9e72; color: white; font-weight: 700; padding: 8px;")
-        self.restore_button = QPushButton("恢复已保存参数")
-        self.default_button = QPushButton("恢复默认参数")
-        copy_button = QPushButton("复制参数")
-        self.save_button.clicked.connect(self._save_current_parameters)
-        self.restore_button.clicked.connect(
-            lambda: self._load_saved_parameters(announce=True))
-        self.default_button.clicked.connect(self._restore_default_parameters)
-        copy_button.clicked.connect(self._copy_parameters)
-        for index, button in enumerate((
-                self.save_button, self.restore_button,
-                self.default_button, copy_button)):
-            button_grid.addWidget(button, index // 2, index % 2)
-        layout.addWidget(self.parameter_text)
-        layout.addWidget(self.config_source_label)
-        layout.addLayout(button_grid)
-        self.right_layout.addWidget(group)
+        # 保留既有页面属性，兼容独立工具与相关测试。
+        self.parameters = self.parameter_widget.parameters
+        self.pan_diagnostics = self.parameter_widget.pan_diagnostics
+        self.tilt_diagnostics = self.parameter_widget.tilt_diagnostics
+        self.parameter_text = self.parameter_widget.parameter_text
+        self.config_source_label = self.parameter_widget.config_source_label
+        self.save_button = self.parameter_widget.save_button
+        self.restore_button = self.parameter_widget.restore_button
+        self.default_button = self.parameter_widget.default_button
+        self.right_layout.addWidget(self.parameter_widget)
+        initial_feedback = self.parameter_widget.feedback_label.text()
+        if initial_feedback:
+            self.control_status.setText(initial_feedback)
 
     def _value(self, key):
-        return self.parameters[key].value()
+        return self.parameter_widget.value(key)
 
-    def _parameters_changed(self, _value=None):
-        if "control_interval" not in self.parameters:
+    def _parameters_changed(self, _values=None):
+        if not hasattr(self, "_control_timer"):
             return
         interval_ms = max(
             1, int(round(self._value("control_interval") * 1000.0)))
         self._control_timer.setInterval(interval_ms)
-        self.parameter_text.setPlainText(self._parameter_export_text())
 
     def _parameter_export_text(self):
-        return (
-            "PAN_KP = %.3f\nPAN_KI = %.3f\nPAN_KD = %.3f\n"
-            "TILT_KP = %.3f\nTILT_KI = %.3f\nTILT_KD = %.3f\n"
-            "GIMBAL_DEADZONE_X = %.3f\nGIMBAL_DEADZONE_Y = %.3f\n"
-            "GIMBAL_CONTROL_INTERVAL_S = %.3f\n"
-            "GIMBAL_MAX_JOG_DEG = %.1f\nGIMBAL_INTEGRAL_LIMIT = %.3f"
-        ) % (
-            self._value("pan_kp"), self._value("pan_ki"),
-            self._value("pan_kd"), self._value("tilt_kp"),
-            self._value("tilt_ki"), self._value("tilt_kd"),
-            self._value("deadzone_x"), self._value("deadzone_y"),
-            self._value("control_interval"), self._value("max_jog"),
-            self._value("integral_limit"),
-        )
+        return self.parameter_widget._parameter_export_text()
 
     def _copy_parameters(self):
-        QApplication.clipboard().setText(self.parameter_text.toPlainText())
-        self.control_status.setText("参数已复制；复制操作未保存配置")
+        self.parameter_widget._copy_parameters()
 
     def _current_pid_config(self):
-        values = {
-            config_key: self._value(ui_key)
-            for ui_key, config_key in _UI_TO_CONFIG_KEYS.items()
-        }
-        values["pan_sign"] = PAN_SIGN
-        values["tilt_sign"] = TILT_SIGN
-        return values
+        return self.parameter_widget.current_pid_config()
 
     def _apply_pid_config(self, values):
-        for ui_key, config_key in _UI_TO_CONFIG_KEYS.items():
-            self.parameters[ui_key].set_value(values[config_key])
-        self._parameters_changed()
+        self.parameter_widget.apply_pid_config(values)
 
     def _load_saved_parameters(self, announce=False):
-        self._stop_auto_control("读取参数前已停止自动控制")
-        result = load_pid_config(self._config_path)
-        self._apply_pid_config(result.values)
-        path_text = str(result.path.resolve())
-        if result.source == "saved":
-            source_text = "当前参数来源：已保存配置"
-        else:
-            source_text = "当前参数来源：默认配置"
-        self.config_source_label.setText(
-            "%s\n配置文件：%s" % (source_text, path_text))
-        if result.error:
-            self.control_status.setText(result.error)
-        elif announce:
-            self.control_status.setText(source_text)
-        return result
+        return self.parameter_widget.load_saved_parameters(
+            announce=announce)
 
     def _restore_default_parameters(self):
-        self._stop_auto_control("恢复默认参数前已停止自动控制")
-        self._apply_pid_config(get_default_pid_config())
-        self.config_source_label.setText(
-            "当前参数来源：默认配置（尚未保存）\n配置文件：%s" %
-            str(load_pid_config(self._config_path).path.resolve()))
-        self.control_status.setText("已恢复默认参数；点击保存后写入配置")
+        self.parameter_widget.restore_default_parameters()
 
     def _save_current_parameters(self):
-        self._stop_auto_control("保存参数前已停止自动控制")
-        try:
-            path = save_pid_config(
-                self._current_pid_config(), self._config_path).resolve()
-        except PIDConfigError as exc:
-            message = "参数保存失败：%s" % exc
-            self.config_source_label.setText(message)
-            self.control_status.setText(message)
-            return False
-        self.config_source_label.setText(
-            "当前参数来源：已保存配置\n配置文件：%s" % path)
-        self.control_status.setText("参数保存成功\n配置文件：%s" % path)
-        return True
+        return self.parameter_widget.save_current_parameters()
 
     def process_frame(self, bgr_frame, bgr_display=None, depth_frame=None):
         now = time.monotonic()

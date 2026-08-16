@@ -16,7 +16,6 @@ from perf_logging import get_perf_logger
 from ui.pages.depth_page import DepthPage
 from ui.pages.enroll_page import EnrollPage
 from ui.pages.face14_page import Face14Page
-from ui.pages.gimbal_pid_tuner_page import GimbalPIDTunerPage
 from ui.pages.gesture_page import GesturePage
 from ui.pages.pedestrian_page import PedestrianPage
 from ui.pages.target_tracking_page import TargetTrackingPage
@@ -41,7 +40,6 @@ class MainWindow(QMainWindow):
         ("人脸录入", "enroll"),
         ("深度识别", "depth"),
         ("动态目标跟踪", "target_tracking"),
-        ("云台 PID 调试", "gimbal_pid_tuner"),
     ]
 
     def __init__(self, yunet_session):
@@ -64,8 +62,7 @@ class MainWindow(QMainWindow):
         self.yunet_session = yunet_session
         self.pages = [Face14Page(self.yunet_session), PedestrianPage(),
                       GesturePage(), EnrollPage(self.yunet_session),
-                      DepthPage(), TargetTrackingPage(),
-                      GimbalPIDTunerPage()]
+                      DepthPage(), TargetTrackingPage()]
         self.nav_buttons = []
         self._build_ui()
         self.capture_thread.frame_ready.connect(self._on_capture_frame)

@@ -8,13 +8,16 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel
 
 from gimbal.controller import GimbalWorker
-from gimbal.pid_config import get_default_pid_config, save_pid_config
+from gimbal.pid_config import (get_default_pid_config, load_pid_config,
+                               save_pid_config)
 from inference.target_tracker import TargetTracker
 from ui.pages.gimbal_pid_tuner_page import GimbalPIDTunerPage
 from ui.pages.target_tracking_page import TargetTrackingPage
+from ui.pid_parameter_widget import PIDParameterDialog
 import ui.pages.target_tracking_page as target_page_module
 
 
@@ -259,6 +262,116 @@ class GimbalPageLifecycleTests(unittest.TestCase):
         page.deleteLater()
         self.app.processEvents()
 
+    def test_target_pid_dialog_reuses_live_tracking_objects(self):
+        ownership = SerialOwnership()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "gimbal_pid.json"
+            page = TargetTrackingPage(
+                gimbal_worker_factory=self._worker_builder(ownership),
+                config_path=config_path)
+            page.show()
+            page.on_activated()
+            self.assertTrue(self._wait_until(lambda: ownership.active == 1))
+
+            frame = np.zeros((360, 640, 3), dtype=np.uint8)
+            rng = np.random.default_rng(23)
+            frame[120:220, 240:400] = rng.integers(
+                0, 256, (100, 160, 3), dtype=np.uint8)
+            self.assertTrue(page._tracker.initialize(
+                frame, (240, 120, 160, 100)))
+            page._normalized_center = (0.1, 0.0)
+            page._tracking_status = "跟踪中"
+            page._gimbal_connected = True
+            page._pan_angle = 90.0
+            page._tilt_angle = 90.0
+            page.follow_button.setChecked(True)
+
+            tracker = page._tracker
+            bbox = tuple(page._tracker.bbox)
+            pan_pid = page._pan_pid
+            tilt_pid = page._tilt_pid
+            worker = page._gimbal_worker
+            page.pid_button.click()
+            self.app.processEvents()
+            dialog = page._pid_dialog
+            self.assertIsInstance(dialog, PIDParameterDialog)
+            self.assertTrue(dialog.isVisible())
+            self.assertFalse(dialog.isModal())
+            self.assertTrue(dialog.windowFlags() & Qt.Tool)
+            self.assertIs(dialog.parent(), page)
+            self.assertTrue(page.isVisible())
+            self.assertIs(page._tracker, tracker)
+            self.assertEqual(tuple(page._tracker.bbox), bbox)
+            self.assertIs(page._pan_pid, pan_pid)
+            self.assertIs(page._tilt_pid, tilt_pid)
+            self.assertIs(page._gimbal_worker, worker)
+            self.assertEqual(ownership.active, 1)
+
+            page.pid_button.click()
+            self.app.processEvents()
+            self.assertIs(page._pid_dialog, dialog)
+            self.assertEqual(len(page.findChildren(PIDParameterDialog)), 1)
+
+            parameters = dialog.parameter_widget.parameters
+            parameters["pan_kp"].set_value(5.5)
+            parameters["pan_ki"].set_value(0.0)
+            parameters["pan_kd"].set_value(0.0)
+            parameters["tilt_kp"].set_value(0.0)
+            parameters["tilt_ki"].set_value(0.0)
+            parameters["tilt_kd"].set_value(0.0)
+            parameters["deadzone_x"].set_value(0.0)
+            parameters["control_interval"].set_value(0.08)
+            page._pending_auto.clear()
+            page._gimbal_connected = True
+            page._pan_angle = 90.0
+            page._tilt_angle = 90.0
+            page._last_pid_time = time.monotonic() - 0.1
+            page._maybe_control_gimbal((0.1, 0.0))
+            self.assertAlmostEqual(page._pid_config["pan_kp"], 5.5)
+            self.assertAlmostEqual(page._last_pan_sample.p_term, 0.55)
+
+            parameters["pan_kp"].set_value(5.75)
+            dialog.parameter_widget.save_button.click()
+            self.app.processEvents()
+            self.assertAlmostEqual(
+                load_pid_config(config_path).values["pan_kp"], 5.75)
+            self.assertTrue(page.follow_button.isChecked())
+            self.assertIs(page._gimbal_worker, worker)
+
+            page._pan_pid.integral = 0.4
+            page._pan_pid.previous_error = 0.1
+            page._pan_pid.accumulator = 0.6
+            dialog.parameter_widget.reset_button.click()
+            self.assertEqual(page._pan_pid.integral, 0.0)
+            self.assertIsNone(page._pan_pid.previous_error)
+            self.assertEqual(page._pan_pid.accumulator, 0.0)
+            page._pan_pid.integral = 0.3
+
+            integral_before_close = page._pan_pid.integral
+            dialog.close()
+            self.app.processEvents()
+            self.assertFalse(dialog.isVisible())
+            self.assertTrue(page._active)
+            self.assertTrue(page.follow_button.isChecked())
+            self.assertIs(page._tracker, tracker)
+            self.assertEqual(tuple(page._tracker.bbox), bbox)
+            self.assertIs(page._gimbal_worker, worker)
+            self.assertEqual(page._pan_pid.integral, integral_before_close)
+            self.assertEqual(ownership.active, 1)
+
+            page.pid_button.click()
+            self.app.processEvents()
+            self.assertIs(page._pid_dialog, dialog)
+            self.assertTrue(dialog.isVisible())
+            page.on_deactivated()
+            self.app.processEvents()
+            self.assertFalse(dialog.isVisible())
+            self.assertEqual(ownership.active, 0)
+            self.assertIsNone(page._gimbal_worker)
+            self.assertEqual(ownership.maximum_active, 1)
+            page.deleteLater()
+            self.app.processEvents()
+
     def test_target_page_stop_paths_reset_all_pid_state(self):
         page = TargetTrackingPage(
             config_path=Path(tempfile.gettempdir()) / "missing_pid_config.json")
@@ -382,6 +495,32 @@ class GimbalPageLifecycleTests(unittest.TestCase):
         page_source = page_path.read_text(encoding="utf-8")
         self.assertNotIn("CaptureThread", page_source)
         self.assertNotIn("OrbbecSource", page_source)
+
+    def test_main_navigation_has_no_seventh_pid_page(self):
+        main_source = (PROJECT_ROOT / "ui" / "main_window.py").read_text(
+            encoding="utf-8")
+        self.assertNotIn('("云台 PID 调试", "gimbal_pid_tuner")',
+                         main_source)
+        self.assertNotIn("GimbalPIDTunerPage", main_source)
+        self.assertEqual(main_source.count("TargetTrackingPage()"), 1)
+
+    def test_shared_parameter_widget_owns_no_runtime_resources(self):
+        widget_source = (PROJECT_ROOT / "ui" /
+                         "pid_parameter_widget.py").read_text(
+                             encoding="utf-8")
+        for forbidden in (
+                "TargetTracker", "PIDAxis", "GimbalWorker",
+                "CaptureThread", "OrbbecSource", "serial.Serial",
+                "QApplication("):
+            self.assertNotIn(forbidden, widget_source)
+
+        tuner_source = (PROJECT_ROOT / "ui" / "pages" /
+                        "gimbal_pid_tuner_page.py").read_text(
+                            encoding="utf-8")
+        tool_source = (PROJECT_ROOT / "tools" /
+                       "gimbal_pid_tuner.py").read_text(encoding="utf-8")
+        self.assertIn("PIDParameterWidget", tuner_source)
+        self.assertIn("GimbalPIDTunerPage", tool_source)
 
 
 if __name__ == "__main__":
