@@ -11,6 +11,7 @@ from queue import Empty, Full, Queue
 from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
 
 from perf_logging import get_perf_logger
+from .face_tracking import decode_face_boxes
 from .face_db_adapter import (DEVICE_ID, MATCH_CONF_TH, SFACE, build_index,
                                detect_face, enroll_person,
                                extract_feature_for_enroll,
@@ -31,6 +32,7 @@ def _log_worker_exception(stage, exc, elapsed_ms=0.0):
 class EnrollWorker(QThread):
     status_ready = pyqtSignal(str)
     match_ready = pyqtSignal(object, object, float, float, str)
+    face_candidates_ready = pyqtSignal(object, object)
     enroll_progress = pyqtSignal(int, int, float, str)
     enroll_complete = pyqtSignal(str, object)
     error_occurred = pyqtSignal(str)
@@ -48,6 +50,7 @@ class EnrollWorker(QThread):
         self._enroll_target = 3
         self._enroll_feats = []
         self._last_error = None
+        self._face_tracking_enabled = threading.Event()
 
     @pyqtSlot(object)
     def submit_frame(self, bgr_frame):
@@ -84,6 +87,12 @@ class EnrollWorker(QThread):
             self._mode = "match"
             self._enroll_name = ""
             self._enroll_feats = []
+
+    def set_face_tracking_enabled(self, enabled):
+        if enabled:
+            self._face_tracking_enabled.set()
+        else:
+            self._face_tracking_enabled.clear()
 
     def stop(self):
         self._running = False
@@ -215,3 +224,20 @@ class EnrollWorker(QThread):
         else:
             self.match_ready.emit(None, None, 0.0, detection_score,
                                   reason or "未检测到人脸")
+        if self._face_tracking_enabled.is_set():
+            self.face_candidates_ready.emit(
+                self._decode_current_face_boxes(bgr_frame), bgr_frame.shape)
+
+    def _decode_current_face_boxes(self, bgr_frame):
+        get_outputs = getattr(
+            self._yunet_session, "last_inference_outputs", None)
+        if get_outputs is None:
+            return []
+        try:
+            return decode_face_boxes(
+                get_outputs(), self._yunet_idx, bgr_frame.shape,
+                MATCH_CONF_TH)
+        except Exception as exc:
+            _log_worker_exception(
+                "EnrollWorker face candidate decode failed", exc)
+            return []

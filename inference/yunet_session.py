@@ -16,6 +16,7 @@ class YuNetSession(object):
         self.model_path = model_path
         self.device_id = device_id
         self._session = None
+        self._last_inference_outputs = None
         self._load_lock = threading.Lock()
         self._infer_lock = threading.Lock()
 
@@ -31,7 +32,17 @@ class YuNetSession(object):
     def infer(self, inputs):
         self.load()
         with self._infer_lock:
-            return self._session.infer(inputs)
+            outputs = self._session.infer(inputs)
+            self._last_inference_outputs = outputs
+            return outputs
+
+    def last_inference_outputs(self):
+        """返回最近一次 infer 输出的结构引用，不复制或重复执行模型。"""
+        with self._infer_lock:
+            outputs = self._last_inference_outputs
+            if isinstance(outputs, list):
+                return tuple(outputs)
+            return outputs
 
     def get_outputs(self):
         self.load()
@@ -43,6 +54,7 @@ class YuNetSession(object):
             with self._infer_lock:
                 session = self._session
                 self._session = None
+                self._last_inference_outputs = None
             if session is not None:
                 del session
                 gc.collect()

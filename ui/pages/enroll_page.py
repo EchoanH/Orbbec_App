@@ -14,8 +14,12 @@ from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QFrame,
                              QMessageBox, QPushButton, QSpinBox, QTableWidget,
                              QTableWidgetItem, QVBoxLayout)
 
+from gimbal.controller import GimbalWorker
+from gimbal.pid import PIDAxis, parse_gimbal_angles, safe_jog_for_angle
+from gimbal.pid_config import get_default_pid_config, load_pid_config
 from inference.enroll_worker import EnrollWorker
 from inference.face_db_adapter import delete_person, list_enrolled
+from inference.face_tracking import FaceTargetLock, normalized_face_center
 from perf_logging import get_perf_logger
 
 from .base_page import BasePage
@@ -23,6 +27,12 @@ from .base_page import BasePage
 
 SMOOTHING_TAU_MS = 30.0
 NAME_STABLE_FRAMES = 3
+PAN_SIGN = -1
+TILT_SIGN = -1
+PAN_SAFE_MIN = 60.0
+PAN_SAFE_MAX = 120.0
+TILT_SAFE_MIN = 60.0
+TILT_SAFE_MAX = 120.0
 LOGGER = logging.getLogger(__name__)
 PERF = get_perf_logger()
 
@@ -47,9 +57,14 @@ class EnrollPage(BasePage):
     page_title = "人脸录入"
     page_hint = "YuNet + SFace · 实时识别与人员库"
 
-    def __init__(self, yunet_session, parent=None):
+    def __init__(self, yunet_session, parent=None,
+                 gimbal_worker_factory=None, config_path=None):
         super(EnrollPage, self).__init__(parent)
         self._yunet_session = yunet_session
+        self._gimbal_worker_factory = (
+            gimbal_worker_factory if gimbal_worker_factory is not None
+            else GimbalWorker)
+        self._config_path = config_path
         self._worker = None
         self._active = False
         self._stop_requested = False
@@ -66,16 +81,31 @@ class EnrollPage(BasePage):
         self._enrolling = False
         self._last_submit_ns = 0
         self._submit_skipped = 0
+        self._face_tracking_enabled = False
+        self._face_target_lock = FaceTargetLock()
+        self._tracked_face_box = None
+        self._pan_pid = PIDAxis()
+        self._tilt_pid = PIDAxis()
+        self._pid_config = get_default_pid_config()
+        self._gimbal_worker = None
+        self._gimbal_connected = False
+        self._gimbal_status = "未连接"
+        self._last_gimbal_error = None
+        self._pan_angle = None
+        self._tilt_angle = None
+        self._pending_auto = {}
+        self._last_pid_time = None
         self._build_controls()
         self._refresh_people()
         app = QApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._shutdown_worker)
+            app.aboutToQuit.connect(self._shutdown_gimbal)
 
     def _build_controls(self):
         panel = QFrame()
         panel.setObjectName("formPanel")
-        panel.setMaximumHeight(250)
+        panel.setMaximumHeight(330)
         outer = QHBoxLayout(panel)
         outer.setContentsMargins(18, 16, 18, 16)
         outer.setSpacing(24)
@@ -100,6 +130,17 @@ class EnrollPage(BasePage):
         self.register_button.setObjectName("primaryButton")
         self.register_button.clicked.connect(self._start_enrollment)
         form.addWidget(self.register_button)
+        self.face_track_button = QPushButton("人脸跟踪：关闭")
+        self.face_track_button.setObjectName("primaryButton")
+        self.face_track_button.setCheckable(True)
+        self.face_track_button.toggled.connect(
+            self._on_face_tracking_toggled)
+        form.addWidget(self.face_track_button)
+        self.face_tracking_label = QLabel(
+            "跟踪目标：未检测到人脸\n云台：未连接")
+        self.face_tracking_label.setObjectName("resultLabel")
+        self.face_tracking_label.setWordWrap(True)
+        form.addWidget(self.face_tracking_label)
         self.result_label = QLabel("识别结果：等待人脸\n相似度：--")
         self.result_label.setObjectName("resultLabel")
         self.result_label.setAlignment(Qt.AlignTop)
@@ -209,6 +250,10 @@ class EnrollPage(BasePage):
         PERF.event("EnrollPage deactivate start", detail="begin worker stop/release")
         self._active = False
         try:
+            if self.face_track_button.isChecked():
+                self.face_track_button.setChecked(False)
+            else:
+                self._shutdown_gimbal()
             self._reset_match()
             self._set_enrolling(False)
             self._restart_when_finished = False
@@ -233,8 +278,10 @@ class EnrollPage(BasePage):
         self._stop_requested = False
         try:
             worker = EnrollWorker(self._yunet_session, self)
+            worker.set_face_tracking_enabled(self._face_tracking_enabled)
             worker.status_ready.connect(self._on_status)
             worker.match_ready.connect(self._on_match)
+            worker.face_candidates_ready.connect(self._on_face_candidates)
             worker.enroll_progress.connect(self._on_enroll_progress)
             worker.enroll_complete.connect(self._on_enroll_complete)
             worker.error_occurred.connect(self._on_error)
@@ -268,6 +315,9 @@ class EnrollPage(BasePage):
         if self._worker is None or not self._worker.isRunning():
             QMessageBox.warning(self, "模型未就绪", "人脸模型尚未启动。")
             return
+        if self._face_tracking_enabled:
+            self._stop_face_auto_control(reset_lock=False)
+            self._set_face_tracking_status("录入期间暂停")
         target = self.sample_spin.value()
         self._set_enrolling(True)
         self.result_label.setText("开始录入 %s：0/%d\n请正对摄像头并保持光线充足" % (name, target))
@@ -316,6 +366,251 @@ class EnrollPage(BasePage):
         self._status_text = "%s · 相似度 %.3f · 检测 %.3f" % (
             display_name, similarity, detection_score)
 
+    def _on_face_candidates(self, candidates, frame_shape):
+        if (not self._active or not self._face_tracking_enabled or
+                self._stop_requested or self._enrolling):
+            return
+        target = self._face_target_lock.update(candidates or [])
+        if target is None:
+            self._stop_face_auto_control(reset_lock=False)
+            target_text = (
+                "等待原锁定人脸" if self._face_target_lock.locked_box is not None
+                else "未检测到人脸")
+            self._set_face_tracking_status(target_text)
+            return
+        self._tracked_face_box = target
+        normalized = normalized_face_center(target, frame_shape)
+        self._set_face_tracking_status("人脸")
+        self._maybe_control_face(normalized)
+
+    def _on_face_tracking_toggled(self, enabled):
+        self.face_track_button.setText(
+            "人脸跟踪：开启" if enabled else "人脸跟踪：关闭")
+        if not enabled:
+            self._face_tracking_enabled = False
+            if self._worker is not None:
+                self._worker.set_face_tracking_enabled(False)
+            self._stop_face_auto_control(reset_lock=True)
+            self._shutdown_gimbal()
+            self._set_face_tracking_status("未检测到人脸")
+            return
+        if not self._active:
+            self.face_track_button.blockSignals(True)
+            self.face_track_button.setChecked(False)
+            self.face_track_button.blockSignals(False)
+            self.face_track_button.setText("人脸跟踪：关闭")
+            return
+        result = load_pid_config(self._config_path)
+        if result.error:
+            self._face_tracking_enabled = False
+            self.face_track_button.blockSignals(True)
+            self.face_track_button.setChecked(False)
+            self.face_track_button.blockSignals(False)
+            self.face_track_button.setText("人脸跟踪：关闭")
+            self._gimbal_status = result.error
+            self._set_face_tracking_status("未检测到人脸")
+            return
+        self._pid_config = result.values
+        self._face_tracking_enabled = True
+        if self._worker is not None:
+            self._worker.set_face_tracking_enabled(True)
+        self._last_gimbal_error = None
+        self._gimbal_status = "连接中"
+        self._stop_face_auto_control(reset_lock=True)
+        self._start_gimbal_worker()
+        self._set_face_tracking_status("未检测到人脸")
+
+    def _start_gimbal_worker(self):
+        if self._gimbal_worker is not None:
+            if not self._gimbal_worker.isFinished():
+                return
+            self._gimbal_worker.deleteLater()
+            self._gimbal_worker = None
+        worker = self._gimbal_worker_factory(parent=self)
+        worker.status_changed.connect(self._on_gimbal_status)
+        worker.connection_changed.connect(self._on_gimbal_connection)
+        worker.response_received.connect(self._on_gimbal_response)
+        worker.command_completed.connect(self._on_gimbal_command_completed)
+        worker.error_occurred.connect(self._on_gimbal_error)
+        worker.finished.connect(self._on_gimbal_finished)
+        self._gimbal_worker = worker
+        worker.start()
+
+    def _on_gimbal_status(self, text):
+        if text == "云台已连接":
+            if self._pan_angle is None or self._tilt_angle is None:
+                self._gimbal_status = "已连接，等待当前角度"
+            else:
+                self._gimbal_status = "PAN %.1f° · TILT %.1f°" % (
+                    self._pan_angle, self._tilt_angle)
+        elif self._last_gimbal_error is None:
+            self._gimbal_status = text
+        self._set_face_tracking_status()
+
+    def _on_gimbal_connection(self, connected):
+        self._gimbal_connected = bool(connected)
+        if connected:
+            self._gimbal_status = "已连接，等待当前角度"
+        else:
+            self._pan_angle = None
+            self._tilt_angle = None
+            self._stop_face_auto_control(reset_lock=False)
+            self._gimbal_status = self._last_gimbal_error or "未连接"
+        self._set_face_tracking_status()
+
+    def _on_gimbal_response(self, response):
+        angles = parse_gimbal_angles(response)
+        if angles is None:
+            self._pan_angle = None
+            self._tilt_angle = None
+            self._gimbal_status = "回复缺少当前角度，自动控制已停止"
+            self._stop_face_auto_control(reset_lock=False)
+        else:
+            self._pan_angle, self._tilt_angle = angles
+            self._gimbal_status = "PAN %.1f° · TILT %.1f°" % angles
+        self._set_face_tracking_status()
+
+    def _on_gimbal_error(self, text):
+        self._last_gimbal_error = text
+        self._gimbal_status = text
+        self._gimbal_connected = False
+        self._pan_angle = None
+        self._tilt_angle = None
+        self._face_tracking_enabled = False
+        if self._worker is not None:
+            self._worker.set_face_tracking_enabled(False)
+        self.face_track_button.blockSignals(True)
+        self.face_track_button.setChecked(False)
+        self.face_track_button.blockSignals(False)
+        self.face_track_button.setText("人脸跟踪：关闭")
+        self._stop_face_auto_control(reset_lock=True)
+        self._shutdown_gimbal(final_status=text)
+        self._set_face_tracking_status("未检测到人脸")
+
+    def _on_gimbal_finished(self):
+        worker = self.sender()
+        if worker is self._gimbal_worker:
+            self._gimbal_worker = None
+        worker.deleteLater()
+        self._gimbal_connected = False
+        self._pan_angle = None
+        self._tilt_angle = None
+        self._stop_face_auto_control(reset_lock=False)
+        if self._last_gimbal_error is None:
+            self._gimbal_status = "未连接"
+        self._set_face_tracking_status()
+
+    def _maybe_control_face(self, normalized_center):
+        worker = self._gimbal_worker
+        if (worker is None or not self._face_tracking_enabled or
+                not self._gimbal_connected or self._pending_auto or
+                self._pan_angle is None or self._tilt_angle is None):
+            return
+        now = time.monotonic()
+        if self._last_pid_time is None:
+            self._last_pid_time = now
+            return
+        dt = now - self._last_pid_time
+        if dt < self._pid_config["control_interval_s"]:
+            return
+        self._last_pid_time = now
+        nx, ny = normalized_center
+        integral_limit = self._pid_config["integral_limit"]
+        max_jog = self._pid_config["max_jog_deg"]
+        try:
+            pan_sample = self._pan_pid.update(
+                nx, dt, self._pid_config["pan_kp"],
+                self._pid_config["pan_ki"], self._pid_config["pan_kd"],
+                self._pid_config["deadzone_x"], integral_limit,
+                max_jog, max_jog)
+            tilt_sample = self._tilt_pid.update(
+                ny, dt, self._pid_config["tilt_kp"],
+                self._pid_config["tilt_ki"], self._pid_config["tilt_kd"],
+                self._pid_config["deadzone_y"], integral_limit,
+                max_jog, max_jog)
+        except ValueError as exc:
+            self._gimbal_status = "PID 参数异常：%s" % exc
+            self._stop_face_auto_control(reset_lock=False)
+            self._set_face_tracking_status()
+            return
+        pan_delta = self._safe_signed_jog(
+            "PAN", pan_sample.jog, PAN_SIGN, self._pan_angle,
+            PAN_SAFE_MIN, PAN_SAFE_MAX, self._pan_pid)
+        tilt_delta = self._safe_signed_jog(
+            "TILT", tilt_sample.jog, TILT_SIGN, self._tilt_angle,
+            TILT_SAFE_MIN, TILT_SAFE_MAX, self._tilt_pid)
+        if pan_delta:
+            self._pending_auto["PAN"] = (
+                self._pan_pid, pan_delta * PAN_SIGN)
+        if tilt_delta:
+            self._pending_auto["TILT"] = (
+                self._tilt_pid, tilt_delta * TILT_SIGN)
+        if pan_delta == 0 and tilt_delta == 0:
+            return
+        worker.set_auto_enabled(True)
+        worker.submit_auto_jog(pan_delta, tilt_delta)
+
+    def _safe_signed_jog(self, axis_name, logical_jog, direction_sign,
+                         current_angle, safe_min, safe_max, pid_axis):
+        requested = int(logical_jog) * int(direction_sign)
+        safe = safe_jog_for_angle(
+            current_angle, requested, safe_min, safe_max)
+        if requested and safe != requested:
+            self._gimbal_status = (
+                "%s 软件安全限位生效：请求 %+d°，允许 %+d°" %
+                (axis_name, requested, safe))
+            if safe == 0:
+                pid_axis.clear_accumulator()
+            self._set_face_tracking_status()
+        return safe
+
+    def _on_gimbal_command_completed(self, command, _response):
+        parts = command.split()
+        if len(parts) != 4 or parts[:2] != ["GIMBAL", "JOG"]:
+            return
+        pending = self._pending_auto.pop(parts[2], None)
+        if pending is None:
+            return
+        pid_axis, logical_jog = pending
+        pid_axis.consume_jog(logical_jog)
+
+    def _reset_face_pid(self):
+        self._pan_pid.reset()
+        self._tilt_pid.reset()
+        self._pending_auto.clear()
+        self._last_pid_time = None
+
+    def _stop_face_auto_control(self, reset_lock=False):
+        worker = self._gimbal_worker
+        if worker is not None:
+            worker.set_auto_enabled(False)
+        self._reset_face_pid()
+        self._tracked_face_box = None
+        if reset_lock:
+            self._face_target_lock.reset()
+
+    def _set_face_tracking_status(self, target_text=None):
+        if target_text is None:
+            target_text = (
+                "人脸" if self._tracked_face_box is not None
+                else "未检测到人脸")
+        self.face_tracking_label.setText(
+            "跟踪目标：%s\n云台：%s" % (target_text, self._gimbal_status))
+
+    def _shutdown_gimbal(self, final_status="未连接"):
+        self._stop_face_auto_control(reset_lock=True)
+        worker = self._gimbal_worker
+        if worker is not None:
+            worker.stop()
+            if worker.isRunning():
+                worker.wait()
+            if worker is self._gimbal_worker:
+                self._gimbal_worker = None
+        self._gimbal_connected = False
+        self._pan_angle = None
+        self._tilt_angle = None
+        self._gimbal_status = final_status
+
     def _on_enroll_progress(self, count, target, score, reason):
         PERF.event("EnrollPage enroll progress",
                    detail="count=%d/%d score=%.3f reason=%s" %
@@ -342,6 +637,8 @@ class EnrollPage(BasePage):
         PERF.event("EnrollPage worker error", detail=str(text), level="WARNING")
         self._reset_match()
         self._set_enrolling(False)
+        self._stop_face_auto_control(reset_lock=False)
+        self._set_face_tracking_status("未检测到人脸")
         self._status_text = text
         self.result_label.setText(text)
 
@@ -355,6 +652,9 @@ class EnrollPage(BasePage):
         should_restart = self._active and self._restart_when_finished
         self._restart_when_finished = False
         self._stop_requested = False
+        if self._face_tracking_enabled:
+            self._stop_face_auto_control(reset_lock=False)
+            self._set_face_tracking_status("人脸模型已停止")
         if should_restart and self._worker is None:
             self._start_worker()
 
