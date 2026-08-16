@@ -1,5 +1,6 @@
 import ast
 import os
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ import numpy as np
 from PyQt5.QtWidgets import QApplication, QGroupBox, QLabel
 
 from gimbal.controller import GimbalWorker
+from gimbal.pid_config import get_default_pid_config, save_pid_config
 from inference.target_tracker import TargetTracker
 from ui.pages.gimbal_pid_tuner_page import GimbalPIDTunerPage
 from ui.pages.target_tracking_page import TargetTrackingPage
@@ -71,6 +73,18 @@ class CountingSerial(object):
         if not self._closed:
             self._closed = True
             self._ownership.active -= 1
+
+
+class RecordingAutoWorker(object):
+    def __init__(self):
+        self.auto_enabled = False
+        self.jogs = []
+
+    def set_auto_enabled(self, enabled):
+        self.auto_enabled = bool(enabled)
+
+    def submit_auto_jog(self, pan_delta, tilt_delta):
+        self.jogs.append((int(pan_delta), int(tilt_delta)))
 
 
 class GimbalPageLifecycleTests(unittest.TestCase):
@@ -135,6 +149,189 @@ class GimbalPageLifecycleTests(unittest.TestCase):
         self.assertFalse(page.auto_enabled)
         page.deleteLater()
         self.app.processEvents()
+
+    def test_tuner_page_saves_and_restores_current_parameters(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "gimbal_pid.json"
+            page = GimbalPIDTunerPage(config_path=config_path)
+            page.parameters["pan_kp"].set_value(5.5)
+            page.parameters["tilt_kd"].set_value(0.45)
+            page.parameters["control_interval"].set_value(0.24)
+            page.parameters["max_jog"].set_value(3.0)
+            page.save_button.click()
+            self.app.processEvents()
+            self.assertTrue(config_path.exists())
+            self.assertIn("参数保存成功", page.control_status.text())
+
+            page.parameters["pan_kp"].set_value(1.0)
+            page.parameters["tilt_kd"].set_value(0.0)
+            result = page._load_saved_parameters(announce=True)
+            self.assertEqual(result.source, "saved")
+            self.assertAlmostEqual(page._value("pan_kp"), 5.5)
+            self.assertAlmostEqual(page._value("tilt_kd"), 0.45)
+            self.assertAlmostEqual(page._value("control_interval"), 0.24)
+            self.assertAlmostEqual(page._value("max_jog"), 3.0)
+            page.deleteLater()
+            self.app.processEvents()
+
+            reopened_page = GimbalPIDTunerPage(config_path=config_path)
+            self.assertAlmostEqual(reopened_page._value("pan_kp"), 5.5)
+            self.assertIn(
+                "当前参数来源：已保存配置",
+                reopened_page.config_source_label.text())
+            reopened_page.deleteLater()
+            self.app.processEvents()
+
+            config_path.write_text("{broken", encoding="utf-8")
+            broken_page = GimbalPIDTunerPage(config_path=config_path)
+            self.assertIn(
+                "参数加载失败，已使用默认值",
+                broken_page.control_status.text())
+            self.assertEqual(broken_page._value("pan_kp"), 4.0)
+            broken_page.deleteLater()
+            self.app.processEvents()
+
+    def test_target_page_reloads_latest_saved_config_on_activation(self):
+        ownership = SerialOwnership()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "gimbal_pid.json"
+            first = get_default_pid_config()
+            first["pan_kp"] = 5.0
+            save_pid_config(first, config_path)
+            page = TargetTrackingPage(
+                gimbal_worker_factory=self._worker_builder(ownership),
+                config_path=config_path)
+            self.assertEqual(page._pid_config["pan_kp"], 5.0)
+
+            latest = dict(first)
+            latest["pan_kp"] = 6.5
+            latest["control_interval_s"] = 0.24
+            save_pid_config(latest, config_path)
+            page.on_activated()
+            self.assertTrue(self._wait_until(lambda: ownership.active == 1))
+            self.assertEqual(page._pid_config["pan_kp"], 6.5)
+            self.assertEqual(page._pid_config["control_interval_s"], 0.24)
+            self.assertEqual(page._config_status, "PID 参数：已保存配置")
+            page.on_deactivated()
+            self.assertEqual(ownership.active, 0)
+            page.deleteLater()
+            self.app.processEvents()
+
+    def test_target_page_uses_fractional_pid_and_fixed_direction(self):
+        page = TargetTrackingPage(
+            config_path=Path(tempfile.gettempdir()) / "missing_pid_config.json")
+        worker = RecordingAutoWorker()
+        page._gimbal_worker = worker
+        page._gimbal_connected = True
+        page._pan_angle = 90.0
+        page._tilt_angle = 90.0
+        page.follow_button.blockSignals(True)
+        page.follow_button.setChecked(True)
+        page.follow_button.blockSignals(False)
+        page._pid_config.update({
+            "pan_kp": 3.5,
+            "pan_ki": 0.0,
+            "pan_kd": 0.0,
+            "tilt_kp": 0.0,
+            "tilt_ki": 0.0,
+            "tilt_kd": 0.0,
+            "deadzone_x": 0.0,
+            "deadzone_y": 0.0,
+            "control_interval_s": 0.08,
+            "max_jog_deg": 2.0,
+        })
+        for _ in range(3):
+            page._last_pid_time = time.monotonic() - 0.1
+            page._maybe_control_gimbal((0.1, 0.0))
+        self.assertEqual(worker.jogs, [(-1, 0)])
+        self.assertIn("PAN", page._pending_auto)
+        page._on_command_completed("GIMBAL JOG PAN -1", "GIMBAL OK")
+        self.assertNotIn("PAN", page._pending_auto)
+        self.assertAlmostEqual(page._pan_pid.accumulator, 0.05, places=5)
+        page._pan_pid.accumulator = 1.5
+        limited = page._safe_signed_jog(
+            "PAN", 1, target_page_module.PAN_SIGN, 60.0,
+            target_page_module.PAN_SAFE_MIN,
+            target_page_module.PAN_SAFE_MAX, page._pan_pid)
+        self.assertEqual(limited, 0)
+        self.assertEqual(page._pan_pid.accumulator, 0.0)
+        page._gimbal_worker = None
+        page.deleteLater()
+        self.app.processEvents()
+
+    def test_target_page_stop_paths_reset_all_pid_state(self):
+        page = TargetTrackingPage(
+            config_path=Path(tempfile.gettempdir()) / "missing_pid_config.json")
+
+        def prime_pid_state():
+            page._pan_pid.integral = 0.4
+            page._pan_pid.previous_error = 0.2
+            page._pan_pid.accumulator = 0.8
+            page._tilt_pid.integral = -0.3
+            page._tilt_pid.previous_error = -0.1
+            page._tilt_pid.accumulator = -0.7
+            page._pending_auto["PAN"] = (page._pan_pid, 1)
+            page._last_pid_time = 1.0
+
+        def assert_reset():
+            for axis in (page._pan_pid, page._tilt_pid):
+                self.assertEqual(axis.integral, 0.0)
+                self.assertIsNone(axis.previous_error)
+                self.assertEqual(axis.accumulator, 0.0)
+            self.assertEqual(page._pending_auto, {})
+            self.assertIsNone(page._last_pid_time)
+
+        prime_pid_state()
+        page.clear_target()
+        assert_reset()
+
+        prime_pid_state()
+        page._on_follow_toggled(False)
+        assert_reset()
+
+        prime_pid_state()
+        page._start_gimbal_worker = lambda: None
+        page._center_gimbal()
+        assert_reset()
+
+        prime_pid_state()
+        page._on_gimbal_error("通信异常：测试")
+        assert_reset()
+
+        class LostTracker(object):
+            state = TargetTracker.TRACKING
+
+            @staticmethod
+            def update(_frame):
+                return None
+
+            @staticmethod
+            def clear():
+                pass
+
+        prime_pid_state()
+        page._tracker = LostTracker()
+        page._active = True
+        frame = np.zeros((32, 32, 3), dtype=np.uint8)
+        page.process_frame(frame, frame, None)
+        assert_reset()
+
+        prime_pid_state()
+        page.on_deactivated()
+        assert_reset()
+        page.deleteLater()
+        self.app.processEvents()
+
+    def test_target_page_no_longer_contains_segmented_jog_logic(self):
+        source = (PROJECT_ROOT / "ui" / "pages" /
+                  "target_tracking_page.py").read_text(encoding="utf-8")
+        for old_name in (
+                "_jog_for_error", "GIMBAL_SMALL_ERROR",
+                "GIMBAL_MEDIUM_ERROR", "GIMBAL_SMALL_JOG_DEG",
+                "GIMBAL_MEDIUM_JOG_DEG", "GIMBAL_LARGE_JOG_DEG"):
+            self.assertNotIn(old_name, source)
+        self.assertIn("PIDAxis", source)
+        self.assertIn("safe_jog_for_angle", source)
 
     def test_target_and_pid_pages_never_overlap_serial_ownership(self):
         ownership = SerialOwnership()

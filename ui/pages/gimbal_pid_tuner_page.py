@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QVBoxLayout,
@@ -28,6 +29,12 @@ from gimbal.pid import (
     PIDDiagnostics,
     parse_gimbal_angles,
     safe_jog_for_angle,
+)
+from gimbal.pid_config import (
+    PIDConfigError,
+    get_default_pid_config,
+    load_pid_config,
+    save_pid_config,
 )
 from inference.target_tracker import TargetTracker, normalized_bbox_center
 
@@ -43,18 +50,33 @@ TILT_SAFE_MIN = 60.0
 TILT_SAFE_MAX = 120.0
 TRACKING_FRAME_TIMEOUT_S = 0.75
 
+_DEFAULT_PID_CONFIG = get_default_pid_config()
 INITIAL_VALUES = {
-    "pan_kp": 4.0,
-    "pan_ki": 0.0,
-    "pan_kd": 0.25,
-    "tilt_kp": 4.0,
-    "tilt_ki": 0.0,
-    "tilt_kd": 0.25,
-    "deadzone_x": 0.13,
-    "deadzone_y": 0.13,
-    "control_interval": 0.18,
-    "max_jog": 2.0,
-    "integral_limit": 1.0,
+    "pan_kp": _DEFAULT_PID_CONFIG["pan_kp"],
+    "pan_ki": _DEFAULT_PID_CONFIG["pan_ki"],
+    "pan_kd": _DEFAULT_PID_CONFIG["pan_kd"],
+    "tilt_kp": _DEFAULT_PID_CONFIG["tilt_kp"],
+    "tilt_ki": _DEFAULT_PID_CONFIG["tilt_ki"],
+    "tilt_kd": _DEFAULT_PID_CONFIG["tilt_kd"],
+    "deadzone_x": _DEFAULT_PID_CONFIG["deadzone_x"],
+    "deadzone_y": _DEFAULT_PID_CONFIG["deadzone_y"],
+    "control_interval": _DEFAULT_PID_CONFIG["control_interval_s"],
+    "max_jog": _DEFAULT_PID_CONFIG["max_jog_deg"],
+    "integral_limit": _DEFAULT_PID_CONFIG["integral_limit"],
+}
+
+_UI_TO_CONFIG_KEYS = {
+    "pan_kp": "pan_kp",
+    "pan_ki": "pan_ki",
+    "pan_kd": "pan_kd",
+    "tilt_kp": "tilt_kp",
+    "tilt_ki": "tilt_ki",
+    "tilt_kd": "tilt_kd",
+    "deadzone_x": "deadzone_x",
+    "deadzone_y": "deadzone_y",
+    "control_interval": "control_interval_s",
+    "max_jog": "max_jog_deg",
+    "integral_limit": "integral_limit",
 }
 
 
@@ -151,11 +173,13 @@ class GimbalPIDTunerPage(BasePage):
     page_title = "云台 PID 调试"
     page_hint = "框选目标 · 运行时 PID 调参 · 软件安全限位"
 
-    def __init__(self, parent=None, gimbal_worker_factory=None):
+    def __init__(self, parent=None, gimbal_worker_factory=None,
+                 config_path=None):
         super(GimbalPIDTunerPage, self).__init__(parent)
         self._gimbal_worker_factory = (
             gimbal_worker_factory if gimbal_worker_factory is not None
             else GimbalWorker)
+        self._config_path = config_path
         self._active = False
         self._tracker = TargetTracker()
         self._pan_pid = PIDAxis()
@@ -186,7 +210,7 @@ class GimbalPIDTunerPage(BasePage):
         self._control_timer = QTimer(self)
         self._control_timer.setTimerType(Qt.PreciseTimer)
         self._control_timer.timeout.connect(self._control_tick)
-        self._parameters_changed()
+        self._load_saved_parameters(announce=True)
         self.video_label.setMouseTracking(True)
         self.video_label.setCursor(Qt.CrossCursor)
         self.video_label.installEventFilter(self)
@@ -320,15 +344,35 @@ class GimbalPIDTunerPage(BasePage):
         self.right_layout.addWidget(self.tilt_diagnostics)
 
     def _build_parameter_export(self):
-        group = QGroupBox("当前最终参数（只读，不写正式页面）")
+        group = QGroupBox("当前最终参数（保存后供动态跟踪使用）")
         layout = QVBoxLayout(group)
         self.parameter_text = QPlainTextEdit()
         self.parameter_text.setReadOnly(True)
         self.parameter_text.setMaximumHeight(235)
+        self.config_source_label = QLabel("当前参数来源：默认配置")
+        self.config_source_label.setWordWrap(True)
+        self.config_source_label.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.config_source_label.setStyleSheet("color: #9fe8cf;")
+        button_grid = QGridLayout()
+        self.save_button = QPushButton("保存当前参数")
+        self.save_button.setStyleSheet(
+            "background: #2f9e72; color: white; font-weight: 700; padding: 8px;")
+        self.restore_button = QPushButton("恢复已保存参数")
+        self.default_button = QPushButton("恢复默认参数")
         copy_button = QPushButton("复制参数")
+        self.save_button.clicked.connect(self._save_current_parameters)
+        self.restore_button.clicked.connect(
+            lambda: self._load_saved_parameters(announce=True))
+        self.default_button.clicked.connect(self._restore_default_parameters)
         copy_button.clicked.connect(self._copy_parameters)
+        for index, button in enumerate((
+                self.save_button, self.restore_button,
+                self.default_button, copy_button)):
+            button_grid.addWidget(button, index // 2, index % 2)
         layout.addWidget(self.parameter_text)
-        layout.addWidget(copy_button)
+        layout.addWidget(self.config_source_label)
+        layout.addLayout(button_grid)
         self.right_layout.addWidget(group)
 
     def _value(self, key):
@@ -360,7 +404,61 @@ class GimbalPIDTunerPage(BasePage):
 
     def _copy_parameters(self):
         QApplication.clipboard().setText(self.parameter_text.toPlainText())
-        self.control_status.setText("参数已复制；正式页面未被修改")
+        self.control_status.setText("参数已复制；复制操作未保存配置")
+
+    def _current_pid_config(self):
+        values = {
+            config_key: self._value(ui_key)
+            for ui_key, config_key in _UI_TO_CONFIG_KEYS.items()
+        }
+        values["pan_sign"] = PAN_SIGN
+        values["tilt_sign"] = TILT_SIGN
+        return values
+
+    def _apply_pid_config(self, values):
+        for ui_key, config_key in _UI_TO_CONFIG_KEYS.items():
+            self.parameters[ui_key].set_value(values[config_key])
+        self._parameters_changed()
+
+    def _load_saved_parameters(self, announce=False):
+        self._stop_auto_control("读取参数前已停止自动控制")
+        result = load_pid_config(self._config_path)
+        self._apply_pid_config(result.values)
+        path_text = str(result.path.resolve())
+        if result.source == "saved":
+            source_text = "当前参数来源：已保存配置"
+        else:
+            source_text = "当前参数来源：默认配置"
+        self.config_source_label.setText(
+            "%s\n配置文件：%s" % (source_text, path_text))
+        if result.error:
+            self.control_status.setText(result.error)
+        elif announce:
+            self.control_status.setText(source_text)
+        return result
+
+    def _restore_default_parameters(self):
+        self._stop_auto_control("恢复默认参数前已停止自动控制")
+        self._apply_pid_config(get_default_pid_config())
+        self.config_source_label.setText(
+            "当前参数来源：默认配置（尚未保存）\n配置文件：%s" %
+            str(load_pid_config(self._config_path).path.resolve()))
+        self.control_status.setText("已恢复默认参数；点击保存后写入配置")
+
+    def _save_current_parameters(self):
+        self._stop_auto_control("保存参数前已停止自动控制")
+        try:
+            path = save_pid_config(
+                self._current_pid_config(), self._config_path).resolve()
+        except PIDConfigError as exc:
+            message = "参数保存失败：%s" % exc
+            self.config_source_label.setText(message)
+            self.control_status.setText(message)
+            return False
+        self.config_source_label.setText(
+            "当前参数来源：已保存配置\n配置文件：%s" % path)
+        self.control_status.setText("参数保存成功\n配置文件：%s" % path)
+        return True
 
     def process_frame(self, bgr_frame, bgr_display=None, depth_frame=None):
         now = time.monotonic()
@@ -764,12 +862,14 @@ class GimbalPIDTunerPage(BasePage):
         if self._active:
             return
         self._active = True
+        load_result = self._load_saved_parameters(announce=False)
         self._frame_times.clear()
         self._display_fps = 0.0
         self._last_frame_time = None
         self._control_timer.start()
         self._start_gimbal_worker()
-        self.control_status.setText("自动控制：关闭；请先框选目标")
+        if not load_result.error:
+            self.control_status.setText("自动控制：关闭；请先框选目标")
         self._update_start_enabled()
 
     def on_deactivated(self):

@@ -8,33 +8,40 @@ from PyQt5.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
                              QPushButton)
 
 from gimbal.controller import GimbalWorker
+from gimbal.pid import PIDAxis, parse_gimbal_angles, safe_jog_for_angle
+from gimbal.pid_config import get_default_pid_config, load_pid_config
 from inference.target_tracker import TargetTracker, normalized_bbox_center
 from ui.draw_utils import draw_text_box_bgr
 
 from .base_page import BasePage
 
 
-# 云台闭环参数均为未实机标定的初始值，需在 Atlas + 实际安装方向下调整。
-GIMBAL_CONTROL_INTERVAL_S = 0.15
-GIMBAL_DEADZONE_X = 0.08
-GIMBAL_DEADZONE_Y = 0.08
-GIMBAL_SMALL_ERROR = 0.22
-GIMBAL_MEDIUM_ERROR = 0.50
-GIMBAL_SMALL_JOG_DEG = 2
-GIMBAL_MEDIUM_JOG_DEG = 3
-GIMBAL_LARGE_JOG_DEG = 5
-PAN_SIGN = 1
-TILT_SIGN = 1
+PAN_SIGN = -1
+TILT_SIGN = -1
+
+PAN_SAFE_MIN = 60.0
+PAN_SAFE_MAX = 120.0
+TILT_SAFE_MIN = 60.0
+TILT_SAFE_MAX = 120.0
 
 
 class TargetTrackingPage(BasePage):
     page_title = "动态目标跟踪"
     page_hint = "鼠标框选目标 · 光流跟踪 · 可选云台跟随"
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, gimbal_worker_factory=None,
+                 config_path=None):
         super(TargetTrackingPage, self).__init__(parent)
+        self._gimbal_worker_factory = (
+            gimbal_worker_factory if gimbal_worker_factory is not None
+            else GimbalWorker)
+        self._config_path = config_path
         self._active = False
         self._tracker = TargetTracker()
+        self._pan_pid = PIDAxis()
+        self._tilt_pid = PIDAxis()
+        self._pid_config = get_default_pid_config()
+        self._config_status = "PID 参数：默认配置"
         self._latest_bgr = None
         self._source_size = None
         self._selecting = False
@@ -45,8 +52,12 @@ class TargetTrackingPage(BasePage):
         self._gimbal_status = "云台未连接"
         self._gimbal_connected = False
         self._gimbal_worker = None
-        self._last_control_time = 0.0
+        self._pan_angle = None
+        self._tilt_angle = None
+        self._pending_auto = {}
+        self._last_pid_time = None
         self._build_controls()
+        self._load_pid_parameters()
         self.video_label.setMouseTracking(True)
         self.video_label.setCursor(Qt.CrossCursor)
         self.video_label.installEventFilter(self)
@@ -252,7 +263,8 @@ class TargetTrackingPage(BasePage):
             self.coordinate_label.setText(text)
 
     def _combined_status(self):
-        return "%s · %s" % (self._tracking_status, self._gimbal_status)
+        return "%s · %s · %s" % (
+            self._tracking_status, self._gimbal_status, self._config_status)
 
     def _start_gimbal_worker(self):
         if self._gimbal_worker is not None:
@@ -260,9 +272,11 @@ class TargetTrackingPage(BasePage):
                 return
             self._gimbal_worker.deleteLater()
             self._gimbal_worker = None
-        worker = GimbalWorker(parent=self)
+        worker = self._gimbal_worker_factory(parent=self)
         worker.status_changed.connect(self._on_gimbal_status)
         worker.connection_changed.connect(self._on_gimbal_connection)
+        worker.response_received.connect(self._on_gimbal_response)
+        worker.command_completed.connect(self._on_command_completed)
         worker.error_occurred.connect(self._on_gimbal_error)
         worker.finished.connect(self._on_gimbal_finished)
         self._gimbal_worker = worker
@@ -276,11 +290,15 @@ class TargetTrackingPage(BasePage):
     def _on_gimbal_connection(self, connected):
         self._gimbal_connected = bool(connected)
         if connected:
-            self._gimbal_status = "云台已连接"
+            self._gimbal_status = "云台已连接，等待角度"
         elif (self._active and
               not self._gimbal_status.startswith("通信异常") and
               not self._gimbal_status.startswith("云台未连接")):
             self._gimbal_status = "云台未连接"
+        if not connected:
+            self._pan_angle = None
+            self._tilt_angle = None
+            self._stop_auto_control()
 
     def _on_gimbal_error(self, text):
         if text.startswith("云台未连接"):
@@ -288,6 +306,9 @@ class TargetTrackingPage(BasePage):
         else:
             self._gimbal_status = text
         self._gimbal_connected = False
+        self._pan_angle = None
+        self._tilt_angle = None
+        self._stop_auto_control()
         if self.follow_button.isChecked():
             self.follow_button.setChecked(False)
 
@@ -296,63 +317,150 @@ class TargetTrackingPage(BasePage):
         if worker is self._gimbal_worker:
             self._gimbal_worker = None
         worker.deleteLater()
+        self._pan_angle = None
+        self._tilt_angle = None
+        self._stop_auto_control()
 
     def _on_follow_toggled(self, enabled):
         self.follow_button.setText(
             "云台跟随：开启" if enabled else "云台跟随：关闭")
         if enabled:
+            self._reset_pid_state()
             self._start_gimbal_worker()
-            if (self._gimbal_worker is not None and
+            if (self._gimbal_worker is not None and self._gimbal_connected and
+                    self._pan_angle is not None and
+                    self._tilt_angle is not None and
                     self._tracker.state == TargetTracker.TRACKING):
                 self._gimbal_worker.set_auto_enabled(True)
+            elif self._pan_angle is None or self._tilt_angle is None:
+                self._gimbal_status = "等待云台真实角度，尚未启动自动控制"
         else:
             self._stop_auto_control()
 
     def _center_gimbal(self):
+        self._stop_auto_control()
         if self.follow_button.isChecked():
             self.follow_button.setChecked(False)
         self._start_gimbal_worker()
         if self._gimbal_worker is not None:
             self._gimbal_worker.request_center()
 
-    @staticmethod
-    def _jog_for_error(error, deadzone, direction_sign):
-        magnitude = abs(float(error))
-        if magnitude <= deadzone:
-            return 0
-        if magnitude < GIMBAL_SMALL_ERROR:
-            step = GIMBAL_SMALL_JOG_DEG
-        elif magnitude < GIMBAL_MEDIUM_ERROR:
-            step = GIMBAL_MEDIUM_JOG_DEG
-        else:
-            step = GIMBAL_LARGE_JOG_DEG
-        return int(direction_sign * (1 if error > 0 else -1) * step)
-
     def _maybe_control_gimbal(self, normalized_center):
         worker = self._gimbal_worker
         if (normalized_center is None or worker is None or
                 not self.follow_button.isChecked() or
-                not self._gimbal_connected):
-            return
-        nx, ny = normalized_center
-        pan_delta = self._jog_for_error(nx, GIMBAL_DEADZONE_X, PAN_SIGN)
-        tilt_delta = self._jog_for_error(ny, GIMBAL_DEADZONE_Y, TILT_SIGN)
-        if pan_delta == 0 and tilt_delta == 0:
-            worker.set_auto_enabled(False)
+                not self._gimbal_connected or self._pending_auto or
+                self._pan_angle is None or self._tilt_angle is None):
             return
         now = time.monotonic()
-        if now - self._last_control_time < GIMBAL_CONTROL_INTERVAL_S:
+        if self._last_pid_time is None:
+            self._last_pid_time = now
+            return
+        dt = now - self._last_pid_time
+        if dt < self._pid_config["control_interval_s"]:
+            return
+        self._last_pid_time = now
+        nx, ny = normalized_center
+        integral_limit = self._pid_config["integral_limit"]
+        max_jog = self._pid_config["max_jog_deg"]
+        try:
+            pan_sample = self._pan_pid.update(
+                nx, dt, self._pid_config["pan_kp"],
+                self._pid_config["pan_ki"], self._pid_config["pan_kd"],
+                self._pid_config["deadzone_x"], integral_limit,
+                max_jog, max_jog)
+            tilt_sample = self._tilt_pid.update(
+                ny, dt, self._pid_config["tilt_kp"],
+                self._pid_config["tilt_ki"], self._pid_config["tilt_kd"],
+                self._pid_config["deadzone_y"], integral_limit,
+                max_jog, max_jog)
+        except ValueError as exc:
+            self._gimbal_status = "PID 参数异常：%s" % exc
+            self._stop_auto_control()
+            if self.follow_button.isChecked():
+                self.follow_button.setChecked(False)
+            return
+        pan_delta = self._safe_signed_jog(
+            "PAN", pan_sample.jog, PAN_SIGN, self._pan_angle,
+            PAN_SAFE_MIN, PAN_SAFE_MAX, self._pan_pid)
+        tilt_delta = self._safe_signed_jog(
+            "TILT", tilt_sample.jog, TILT_SIGN, self._tilt_angle,
+            TILT_SAFE_MIN, TILT_SAFE_MAX, self._tilt_pid)
+        if pan_delta:
+            self._pending_auto["PAN"] = (
+                self._pan_pid, pan_delta * PAN_SIGN)
+        if tilt_delta:
+            self._pending_auto["TILT"] = (
+                self._tilt_pid, tilt_delta * TILT_SIGN)
+        if pan_delta == 0 and tilt_delta == 0:
             return
         worker.set_auto_enabled(True)
         worker.submit_auto_jog(pan_delta, tilt_delta)
-        self._last_control_time = now
+
+    def _safe_signed_jog(self, axis_name, logical_jog, direction_sign,
+                         current_angle, safe_min, safe_max, pid_axis):
+        requested = int(logical_jog) * int(direction_sign)
+        safe = safe_jog_for_angle(
+            current_angle, requested, safe_min, safe_max)
+        if requested and safe != requested:
+            self._gimbal_status = (
+                "%s 软件安全限位生效：请求 %+d°，允许 %+d°" %
+                (axis_name, requested, safe))
+            if safe == 0:
+                pid_axis.clear_accumulator()
+        return safe
+
+    def _on_command_completed(self, command, _response):
+        parts = command.split()
+        if len(parts) != 4 or parts[:2] != ["GIMBAL", "JOG"]:
+            return
+        axis_name = parts[2]
+        pending = self._pending_auto.pop(axis_name, None)
+        if pending is None:
+            return
+        pid_axis, logical_jog = pending
+        pid_axis.consume_jog(logical_jog)
+
+    def _on_gimbal_response(self, response):
+        angles = parse_gimbal_angles(response)
+        if angles is None:
+            self._pan_angle = None
+            self._tilt_angle = None
+            self._gimbal_status = "云台回复缺少真实角度，自动控制已停止"
+            self._stop_auto_control()
+            if self.follow_button.isChecked():
+                self.follow_button.setChecked(False)
+            return
+        self._pan_angle, self._tilt_angle = angles
+        self._gimbal_status = "云台角度：PAN %.1f° · TILT %.1f°" % angles
+
+    def _reset_pid_state(self):
+        self._pan_pid.reset()
+        self._tilt_pid.reset()
+        self._pending_auto.clear()
+        self._last_pid_time = None
 
     def _stop_auto_control(self):
-        self._last_control_time = 0.0
         if self._gimbal_worker is not None:
             self._gimbal_worker.set_auto_enabled(False)
+        self._reset_pid_state()
+
+    def _load_pid_parameters(self):
+        self._stop_auto_control()
+        result = load_pid_config(self._config_path)
+        self._pid_config = result.values
+        if result.error:
+            self._config_status = result.error
+        elif result.source == "saved":
+            self._config_status = "PID 参数：已保存配置"
+        else:
+            self._config_status = "PID 参数：默认配置"
+        return result
 
     def on_activated(self):
+        if self._active:
+            return
+        self._load_pid_parameters()
         self._active = True
         self._start_gimbal_worker()
 
@@ -374,3 +482,5 @@ class TargetTrackingPage(BasePage):
                 self._gimbal_worker = None
         self._gimbal_connected = False
         self._gimbal_status = "云台未连接"
+        self._pan_angle = None
+        self._tilt_angle = None

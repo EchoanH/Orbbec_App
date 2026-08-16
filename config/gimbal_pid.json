@@ -1,0 +1,15 @@
+{
+  "pan_kp": 4.0,
+  "pan_ki": 0.0,
+  "pan_kd": 0.25,
+  "tilt_kp": 4.0,
+  "tilt_ki": 0.0,
+  "tilt_kd": 0.25,
+  "deadzone_x": 0.13,
+  "deadzone_y": 0.13,
+  "control_interval_s": 0.18,
+  "max_jog_deg": 2.0,
+  "integral_limit": 1.0,
+  "pan_sign": -1,
+  "tilt_sign": -1
+}
